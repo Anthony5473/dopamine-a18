@@ -705,6 +705,8 @@
 			membershipExceptions = (
 				ClearSword.h,
 				ClearSword.m,
+				a18iosurface.c,
+				a18iosurface.h,
 				exploit/common.h,
 				exploit/free_thread.c,
 				exploit/free_thread.h,
