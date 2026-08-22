@@ -703,10 +703,10 @@
 		2F11A31F301BFDAF00C1C9F0 /* PBXFileSystemSynchronizedBuildFileExceptionSet */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				ClearSword.h,
-				ClearSword.m,
 				a18iosurface.c,
 				a18iosurface.h,
+				ClearSword.h,
+				ClearSword.m,
 				exploit/common.h,
 				exploit/free_thread.c,
 				exploit/free_thread.h,
