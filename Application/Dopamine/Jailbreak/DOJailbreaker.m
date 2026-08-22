@@ -64,8 +64,6 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
     JBErrorCodeFailedDuplicateApps           = -14,
 };
 
-@implementation DOJailbreaker
-
 // ===== v15 jb-phase telemetry (mirror of exploit/a18beacon.c) =====
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -112,6 +110,8 @@ static void jb_beacon(const char *fmt, ...)
     close(fd);
 }
 // ===== end v15 telemetry =====
+
+@implementation DOJailbreaker
 
 - (NSError *)gatherSystemInformation
 {
