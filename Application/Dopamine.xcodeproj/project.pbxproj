@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0A18A0012F8D000000C979A6 /* IOKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2F11A32A301C007500C1C9F0 /* IOKit.framework */; };
+		0A18A0022F8D000000C979A6 /* IOSurface.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2F11A328301C006D00C1C9F0 /* IOSurface.framework */; };
 		040622AA2B77FE8E00393AAD /* DOPkgManagerPickerViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 040622A92B77FE8E00393AAD /* DOPkgManagerPickerViewController.m */; };
 		042479A22B66916B0082581B /* DOCreditsViewController.m in Sources */ = {isa = PBXBuildFile; fileRef = 0424796B2B66916B0082581B /* DOCreditsViewController.m */; };
 		042479A32B66916B0082581B /* DOSettingsController.m in Sources */ = {isa = PBXBuildFile; fileRef = 0424796C2B66916B0082581B /* DOSettingsController.m */; };
@@ -783,6 +785,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				8C3B2E04301BC1F400C979A6 /* libjailbreak.dylib in Frameworks */,
+				0A18A0012F8D000000C979A6 /* IOKit.framework in Frameworks */,
+				0A18A0022F8D000000C979A6 /* IOSurface.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
