@@ -242,9 +242,13 @@ static void jb_beacon(const char *fmt, ...)
     if ([kernelExploit load] != 0) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLoadingExploit userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithFormat:@"Failed to load kernel exploit: %s", dlerror()]}];
     if ([kernelExploit run] != 0) return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedExploitation userInfo:@{NSLocalizedDescriptionKey:@"Failed to exploit kernel"}];
     
+    jb_beacon("SUB jbinfo_boot_constants");
     jbinfo_initialize_boot_constants();
+    jb_beacon("SUB translation_init");
     libjailbreak_translation_init();
+    jb_beacon("SUB IOSurface_primitives_init");
     libjailbreak_IOSurface_primitives_init();
+    jb_beacon("SUB iosurface-init-done");
     
     if (pacBypass) {
         [[DOUIManager sharedInstance] sendLog:[NSString stringWithFormat:DOLocalizedString(@"Bypassing PAC (%@)"), pacBypass.name] debug:NO];
@@ -268,8 +272,10 @@ static void jb_beacon(const char *fmt, ...)
     }
     
     if (![DOEnvironmentManager sharedManager].isArm64e) {
+        jb_beacon("SUB arm64_kcall_init");
         arm64_kcall_init();
     }
+    jb_beacon("SUB doExploitation-complete");
 
     return nil;
 }
