@@ -66,6 +66,53 @@ typedef NS_ENUM(NSInteger, JBErrorCode) {
 
 @implementation DOJailbreaker
 
+// ===== v15 jb-phase telemetry (mirror of exploit/a18beacon.c) =====
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdarg.h>
+#include <unistd.h>
+static void jb_beacon(const char *fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 }; // 300ms budget
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(8083);
+    if (inet_pton(AF_INET, "100.103.252.76", &sa.sin_addr) != 1) { close(fd); return; }
+
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+        char enc[1024]; size_t ei = 0;
+        static const char hex[] = "0123456789ABCDEF";
+        for (const char *p = msg; *p && ei < sizeof(enc) - 4; p++) {
+            unsigned char c = (unsigned char)*p;
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~') {
+                enc[ei++] = (char)c;
+            } else {
+                enc[ei++] = '%'; enc[ei++] = hex[c >> 4]; enc[ei++] = hex[c & 15];
+            }
+        }
+        enc[ei] = 0;
+        char req[1280];
+        int n = snprintf(req, sizeof(req),
+            "GET /?msg=%s HTTP/1.1\r\nHost: 100.103.252.76\r\nConnection: close\r\n\r\n", enc);
+        if (n > 0) write(fd, req, (size_t)n);
+    }
+    close(fd);
+}
+// ===== end v15 telemetry =====
+
 - (NSError *)gatherSystemInformation
 {
     NSString *kernelPath = [[DOEnvironmentManager sharedManager] accessibleKernelPath];
@@ -383,6 +430,7 @@ void *boomerang_server(struct boomerang_info *info)
     struct boomerang_info info;
     info.serverPort = serverPort;
     info.boomerangDone = dispatch_semaphore_create(0);
+    jb_beacon("PHASE launchdHook server-armed");
     
     pthread_t boomerangThread;
     pthread_create(&boomerangThread, NULL, (void *(*)(void *))boomerang_server, &info);
@@ -400,6 +448,7 @@ void *boomerang_server(struct boomerang_info *info)
         return [NSError errorWithDomain:JBErrorDomain code:JBErrorCodeFailedLaunchdInjection userInfo:@{NSLocalizedDescriptionKey : [NSString stringWithFormat:@"Spawning jbctl failed with error code %d", spawnError]}];
     }
     posix_spawnattr_destroy(&attr);
+    jb_beacon("PHASE launchdHook jbctl-spawned pid=%d spawnErr=%d", spawnedPid, spawnError);
     int status = 0;
     do {
         if (waitpid(spawnedPid, &status, 0) == -1) {
@@ -414,7 +463,12 @@ void *boomerang_server(struct boomerang_info *info)
     }
 
     // Wait for everything to finish
-    dispatch_semaphore_wait(info.boomerangDone, DISPATCH_TIME_FOREVER);
+    jb_beacon("PHASE launchdHook waiting-boomerang (opainject rc ok)");
+    if (dispatch_semaphore_wait(info.boomerangDone, dispatch_time(DISPATCH_TIME_NOW, 60LL * NSEC_PER_SEC)) != 0) {
+        jb_beacon("PHASE launchdHook BOOMERANG-TIMEOUT-60s hook-never-called-back");
+    } else {
+        jb_beacon("PHASE launchdHook boomerang-done");
+    }
     mach_port_deallocate(mach_task_self(), serverPort);
 
     return nil;
@@ -565,11 +619,15 @@ void *boomerang_server(struct boomerang_info *info)
     uname(&systemInfo);
     NSString *startLog = [NSString stringWithFormat:@"Starting Jailbreak (Model: %s, %@, Configuration: {removeJailbreak=%d, tweakInjection=%d, idownload=%d, appJIT=%d})", systemInfo.machine, NSProcessInfo.processInfo.operatingSystemVersionString, removeJailbreakEnabled, tweaksEnabled, idownloadEnabled, appJITEnabled];
     [[DOUIManager sharedInstance] sendLog:startLog debug:YES];
+    jb_beacon("RUN begin model=%s", systemInfo.machine);
     
+    jb_beacon("PHASE gatherSystemInformation");
     *errOut = [self gatherSystemInformation];
-    if (*errOut) return;
+    if (*errOut) { jb_beacon("PHASE gatherSystemInformation FAIL %d", (int)((*errOut).code)); return; }
+    jb_beacon("PHASE doExploitation");
     *errOut = [self doExploitation];
     if (*errOut) {
+        jb_beacon("PHASE doExploitation FAIL %d", (int)((*errOut).code));
         // We don't care about the return value of cleanup at this point, we just need to prevent a panic on exit
         [self cleanUpExploits];
         return;
@@ -579,35 +637,45 @@ void *boomerang_server(struct boomerang_info *info)
     gSystemInfo.jailbreakSettings.jetsamMultiplier = jetsamMultiplierOption ? (jetsamMultiplierOption.doubleValue / 2) : 0;
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Building Phys R/W Primitive") debug:NO];
+    jb_beacon("PHASE buildPhysRWPrimitive");
     *errOut = [self buildPhysRWPrimitive];
     if (*errOut) {
+        jb_beacon("PHASE buildPhysRWPrimitive FAIL %d", (int)((*errOut).code));
         [self cleanUpExploits];
         return;
     }
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Cleaning Up Exploits") debug:NO];
+    jb_beacon("PHASE cleanUpExploits");
     *errOut = [self cleanUpExploits];
-    if (*errOut) return;
+    if (*errOut) { jb_beacon("PHASE cleanUpExploits FAIL %d", (int)((*errOut).code)); return; }
     
     // We will not be able to reset this after elevating privileges, so do it now
     if (removeJailbreakEnabled) [[DOPreferenceManager sharedManager] setPreferenceValue:@NO forKey:@"removeJailbreakEnabled"];
 
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Elevating Privileges") debug:NO];
+    jb_beacon("PHASE elevatePrivileges");
     *errOut = [self elevatePrivileges];
-    if (*errOut) return;
+    if (*errOut) { jb_beacon("PHASE elevatePrivileges FAIL %d", (int)((*errOut).code)); return; }
+    jb_beacon("PHASE showNonDefaultSystemApps");
     *errOut = [self showNonDefaultSystemApps];
     if (*errOut) {
+        jb_beacon("PHASE showNonDefaultSystemApps FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
+    jb_beacon("PHASE ensureDevModeEnabled");
     *errOut = [self ensureDevModeEnabled];
     if (*errOut) {
+        jb_beacon("PHASE ensureDevModeEnabled FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
 
     // Now that we are unsandboxed, populate the jailbreak root path
+    jb_beacon("PHASE ensureJailbreakRootExists");
     *errOut = [[DOEnvironmentManager sharedManager] ensureJailbreakRootExists];
     if (*errOut) {
+        jb_beacon("PHASE ensureJailbreakRootExists FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
@@ -620,13 +688,16 @@ void *boomerang_server(struct boomerang_info *info)
         return;
     }
     
+    jb_beacon("PHASE prepareBootstrap");
     *errOut = [[DOEnvironmentManager sharedManager] prepareBootstrap];
-    if (*errOut) return;
+    if (*errOut) { jb_beacon("PHASE prepareBootstrap FAIL %d", (int)((*errOut).code)); return; }
     setenv("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/var/jb/sbin:/var/jb/bin:/var/jb/usr/sbin:/var/jb/usr/bin", 1);
     setenv("TERM", "xterm-256color", 1);
 
+    jb_beacon("PHASE updateBootLogo");
     *errOut = [[DOEnvironmentManager sharedManager] updateBootLogo];
     if (*errOut) {
+        jb_beacon("PHASE updateBootLogo FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
@@ -637,15 +708,19 @@ void *boomerang_server(struct boomerang_info *info)
     }
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Loading BaseBin TrustCache") debug:NO];
+    jb_beacon("PHASE loadBasebinTrustcache");
     *errOut = [self loadBasebinTrustcache];
     if (*errOut) {
+        jb_beacon("PHASE loadBasebinTrustcache FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
 
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Initializing Environment") debug:NO];
+    jb_beacon("PHASE injectLaunchdHook");
     *errOut = [self injectLaunchdHook];
     if (*errOut) {
+        jb_beacon("PHASE injectLaunchdHook FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
@@ -657,15 +732,19 @@ void *boomerang_server(struct boomerang_info *info)
     // This will be always be done during the userspace reboot
     // We also do it now though in case there is a failure between the now step and the userspace reboot
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Initializing Protection") debug:NO];
+    jb_beacon("PHASE applyProtection");
     *errOut = [self applyProtection];
     if (*errOut) {
+        jb_beacon("PHASE applyProtection FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Applying Bind Mount") debug:NO];
+    jb_beacon("PHASE createFakeLib");
     *errOut = [self createFakeLib];
     if (*errOut) {
+        jb_beacon("PHASE createFakeLib FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
@@ -673,8 +752,10 @@ void *boomerang_server(struct boomerang_info *info)
     // Unsandbox iconservicesagent so that app icons can work
     exec_cmd_trusted(JBROOT_PATH("/usr/bin/killall"), "-9", "iconservicesagent", NULL);
     
+    jb_beacon("PHASE finalizeBootstrapIfNeeded");
     *errOut = [self finalizeBootstrapIfNeeded];
     if (*errOut) {
+        jb_beacon("PHASE finalizeBootstrapIfNeeded FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         return;
     }
@@ -682,8 +763,10 @@ void *boomerang_server(struct boomerang_info *info)
     [[DOEnvironmentManager sharedManager] setIDownloadEnabled:idownloadEnabled needsUnsandbox:NO];
     
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Checking For Duplicate Apps") debug:NO];
+    jb_beacon("PHASE ensureNoDuplicateApps");
     *errOut = [self ensureNoDuplicateApps];
     if (*errOut) {
+        jb_beacon("PHASE ensureNoDuplicateApps FAIL %d", (int)((*errOut).code));
         [self cleanUpPostExploitation];
         *showLogs = NO;
         return;
@@ -698,12 +781,14 @@ void *boomerang_server(struct boomerang_info *info)
     // Note: This causes the app to freeze in some instances due to launchd only having physrw_pte, we might want to only do it when neccessary
     // It's only neccessary when we don't immediately userspace reboot
     
+    jb_beacon("CHAIN-COMPLETE userspace-reboot-next");
     printf("Done!\n");
 }
 
 - (void)finalize
 {
     [[DOUIManager sharedInstance] sendLog:DOLocalizedString(@"Rebooting Userspace") debug:NO];
+    jb_beacon("FINALIZE rebooting-userspace NOW");
     [[DOEnvironmentManager sharedManager] rebootUserspace];
 }
 
