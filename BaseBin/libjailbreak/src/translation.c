@@ -54,7 +54,7 @@ static void tr_beacon(const char *fmt, ...)
 static struct {
 	uint64_t lo;
 	uint64_t hi;
-} tr_guard_windows[PTOV_TABLE_SIZE_ + 4];
+} tr_guard_windows[48];
 static int tr_guard_window_count = 0;
 static bool tr_guard_inited = false;
 
@@ -124,11 +124,19 @@ static uint64_t phystokv_ex(uint64_t pa, int *out_mode)
 			}
 		}
 
-		// v20 NOTE: this fallback is the prime suspect for the +0x6334
-		// EXPAND panics -- naive arithmetic that can produce garbage when
-		// the PA belongs to a PAPT region instead of the physBase span.
-		va = pa - kconstant(physBase) + kconstant(virtBase);
-		mode = P2V_FALLBACK;
+		// v21: ptov resolved but missed this PA. On SPTM platforms (PAPT
+		// present) try the PAPT and NOTHING else. Run 3 (08-23 14:32) proved
+		// the naive arithmetic lands inside PAPT spans -- kernelcache text/
+		// exec is papt[1] @ 0xfffffff04c2f0000 -- and detonates at
+		// textexec+0x6334. Arithmetic is now reachable ONLY on legacy boots
+		// where neither ptov_table nor libsptm_papt_ranges resolved.
+		if (ksymbol(libsptm_papt_ranges)) {
+			va = sptm_phystokv(pa);
+			if (va) mode = P2V_PAPT;
+		} else {
+			va = pa - kconstant(physBase) + kconstant(virtBase);
+			mode = P2V_FALLBACK;
+		}
 	}
 	else if (ksymbol(libsptm_papt_ranges)) {
 		va = sptm_phystokv(pa);
@@ -179,7 +187,7 @@ static void tr_phystokv_telemetry_once(void)
 			uint64_t papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
 			tr_beacon("P2V papt table=%#llx n=%llu",
 				(unsigned long long)papt_table, (unsigned long long)papt_table_n);
-			if (papt_table_n > 16) papt_table_n = 16; // cap beacon spam
+			if (papt_table_n > 24) papt_table_n = 24; // bounded, covers n=22 boots
 			struct sptm_papt_entry {
 				uint64_t paddr_start;
 				uint64_t papt_start;
@@ -224,7 +232,7 @@ static void tr_guard_init(void)
 	if (ksymbol(libsptm_papt_ranges)) {
 		uint64_t papt_table = kread_ptr(ksymbol(libsptm_papt_ranges));
 		uint64_t papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
-		if (papt_table_n > 8) papt_table_n = 8;
+		if (papt_table_n > 32) papt_table_n = 32;
 		struct sptm_papt_entry {
 			uint64_t paddr_start;
 			uint64_t papt_start;
@@ -282,7 +290,9 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		telemetry_done = true;
 		tr_phystokv_telemetry_once();
 		tr_guard_init();
-		tr_beacon("GUARD armed windows=%d root=%llu", tr_guard_window_count, (unsigned long long)ROOT_LEVEL);
+		tr_beacon("GUARD armed windows=%d root=%llu policy=%s", tr_guard_window_count,
+			(unsigned long long)ROOT_LEVEL,
+			ksymbol(ptov_table) ? "ptov" : (ksymbol(libsptm_papt_ranges) ? "papt-only" : "legacy"));
 	}
 
 	for (uint64_t curLevel = ROOT_LEVEL; curLevel <= LEAF_LEVEL; curLevel++) {
@@ -326,19 +336,24 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 			tte_ttep = tteEntry & ARM_TTE_TABLE_MASK;
 		}
 		else {
+			uint64_t srcPa = tteEntry & ARM_TTE_TABLE_MASK;
 			int mode = P2V_NONE;
-			uint64_t nextTtep = phystokv_ex(tteEntry & ARM_TTE_TABLE_MASK, &mode);
+			uint64_t nextTtep = phystokv_ex(srcPa, &mode);
 
-			// v20 WANDER GUARD: refuse to kread an address phystokv cannot
-			// vouch for. The +0x6334 panics were kreads through exactly such
-			// addresses (far=0xfffffff04cd29ba8, kernel static region).
-			if (!nextTtep || !tr_va_in_known_window(nextTtep)) {
-				tr_beacon("EXPAND-WANDER va=%#llx lvl=%llu src_tte=%#llx tte_va=%#llx mode=%s cand=%#llx",
+			// v21 WANDER GUARD (strict): with the arithmetic fallback gone,
+			// a zero/fallback answer means this PA is in NO known region.
+			// Also require page alignment -- real TT table pointers always
+			// are, and the killer far (...29ba8) was not.
+			bool alignOk = ((nextTtep & (vm_real_kernel_page_size - 1)) == 0);
+			if (!nextTtep || !alignOk || !tr_va_in_known_window(nextTtep)) {
+				tr_beacon("EXPAND-WANDER va=%#llx lvl=%llu src_tte=%#llx pa=%#llx tte_va=%#llx mode=%s cand=%#llx%s",
 					(unsigned long long)va, (unsigned long long)curLevel,
 					(unsigned long long)tteEntry,
+					(unsigned long long)srcPa,
 					(unsigned long long)(tte_ttep + (tteIndex * sizeof(uint64_t))),
 					tr_p2v_mode_name(mode),
-					(unsigned long long)nextTtep);
+					(unsigned long long)nextTtep,
+					alignOk ? "" : " MISALIGN");
 				errno = 1045;
 				return 0;
 			}
