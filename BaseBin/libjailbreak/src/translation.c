@@ -4,10 +4,78 @@
 #include "info.h"
 #include <errno.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
 
 struct tt_level arm_tt_level[4];
 
+// v20: self-contained beacon (same shape as lb_beacon in util.c, kept separate
+// so translation.c has no dependency ordering on util.c)
+static void tr_beacon(const char *fmt, ...)
+{
+	char msg[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return;
+	struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(8083);
+	if (inet_pton(AF_INET, "100.103.252.76", &sa.sin_addr) != 1) { close(fd); return; }
+	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+		char req[1280];
+		char enc[1024]; size_t ei = 0;
+		static const char hex[] = "0123456789ABCDEF";
+		for (const char *p = msg; *p && ei < sizeof(enc) - 4; p++) {
+			unsigned char c = (unsigned char)*p;
+			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) enc[ei++] = (char)c;
+			else { enc[ei++] = '%'; enc[ei++] = hex[c >> 4]; enc[ei++] = hex[c & 15]; }
+		}
+		enc[ei] = 0;
+		int n = snprintf(req, sizeof(req),
+			"GET /?msg=%s HTTP/1.1\r\nHost: 100.103.252.76\r\nConnection: close\r\n\r\n", enc);
+		if (n > 0) { size_t len = (size_t)n; ssize_t w = write(fd, req, len); (void)w; }
+	}
+	close(fd);
+}
+
+// v20: known-good kernel VA windows for wander-guarding phystokv() results.
+// Populated lazily on first use from kconstants + the resolved ptov/papt tables.
+#define PTOV_TABLE_SIZE_ 8
+static struct {
+	uint64_t lo;
+	uint64_t hi;
+} tr_guard_windows[PTOV_TABLE_SIZE_ + 4];
+static int tr_guard_window_count = 0;
+static bool tr_guard_inited = false;
+
 // Address translation physical <-> virtual
+
+// v20 classification result of the last phystokv call
+enum {
+	P2V_NONE = 0,
+	P2V_PTOV,
+	P2V_PAPT,
+	P2V_FALLBACK,
+};
+static const char *tr_p2v_mode_name(int mode)
+{
+	switch (mode) {
+		case P2V_PTOV:     return "ptov";
+		case P2V_PAPT:     return "papt";
+		case P2V_FALLBACK: return "fallback";
+		default:           return "none";
+	}
+}
 
 uint64_t sptm_phystokv(uint64_t pa)
 {
@@ -34,30 +102,169 @@ uint64_t sptm_phystokv(uint64_t pa)
 	return 0;
 }
 
-#define PTOV_TABLE_SIZE 8
-uint64_t phystokv(uint64_t pa)
+// v20: out_mode classifies which path produced the answer (for beacons/guards)
+static uint64_t phystokv_ex(uint64_t pa, int *out_mode)
 {
+	int mode = P2V_NONE;
+	uint64_t va = 0;
+
 	if (ksymbol(ptov_table)) {
 		struct ptov_table_entry {
 			uint64_t pa;
 			uint64_t va;
 			uint64_t len;
-		} ptov_table[PTOV_TABLE_SIZE];
+		} ptov_table[PTOV_TABLE_SIZE_];
 		kreadbuf(ksymbol(ptov_table), &ptov_table[0], sizeof(ptov_table));
 
-		for (uint64_t i = 0; (i < PTOV_TABLE_SIZE) && (ptov_table[i].len != 0); i++) {
+		for (uint64_t i = 0; (i < PTOV_TABLE_SIZE_) && (ptov_table[i].len != 0); i++) {
 			if ((pa >= ptov_table[i].pa) && (pa < (ptov_table[i].pa + ptov_table[i].len))) {
-				return pa - ptov_table[i].pa + ptov_table[i].va;
+				va = pa - ptov_table[i].pa + ptov_table[i].va;
+				mode = P2V_PTOV;
+				goto done;
 			}
 		}
 
-		return pa - kconstant(physBase) + kconstant(virtBase);
+		// v20 NOTE: this fallback is the prime suspect for the +0x6334
+		// EXPAND panics -- naive arithmetic that can produce garbage when
+		// the PA belongs to a PAPT region instead of the physBase span.
+		va = pa - kconstant(physBase) + kconstant(virtBase);
+		mode = P2V_FALLBACK;
 	}
 	else if (ksymbol(libsptm_papt_ranges)) {
-		return sptm_phystokv(pa);
+		va = sptm_phystokv(pa);
+		mode = va ? P2V_PAPT : P2V_NONE;
 	}
 
-	return 0;
+done:
+	if (out_mode) *out_mode = mode;
+	return va;
+}
+
+uint64_t phystokv(uint64_t pa)
+{
+	int mode = P2V_NONE;
+	return phystokv_ex(pa, &mode);
+}
+
+// v20: one-time telemetry dump of everything phystokv depends on
+static bool tr_telemetry_done = false;
+static void tr_phystokv_telemetry_once(void)
+{
+	if (tr_telemetry_done) return;
+	tr_telemetry_done = true;
+	{
+		tr_beacon("P2V init ptov_sym=%#llx papt_sym=%#llx physBase=%#llx virtBase=%#llx",
+			(unsigned long long)ksymbol(ptov_table),
+			(unsigned long long)ksymbol(libsptm_papt_ranges),
+			(unsigned long long)kconstant(physBase),
+			(unsigned long long)kconstant(virtBase));
+
+		if (ksymbol(ptov_table)) {
+			struct ptov_table_entry {
+				uint64_t pa;
+				uint64_t va;
+				uint64_t len;
+			} ptov_table[PTOV_TABLE_SIZE_];
+			kreadbuf(ksymbol(ptov_table), &ptov_table[0], sizeof(ptov_table));
+			for (int i = 0; i < PTOV_TABLE_SIZE_; i++) {
+				tr_beacon("P2V ptov[%d] pa=%#llx va=%#llx len=%#llx", i,
+					(unsigned long long)ptov_table[i].pa,
+					(unsigned long long)ptov_table[i].va,
+					(unsigned long long)ptov_table[i].len);
+			}
+		}
+
+		if (ksymbol(libsptm_papt_ranges)) {
+			uint64_t papt_table = kread_ptr(ksymbol(libsptm_papt_ranges));
+			uint64_t papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+			tr_beacon("P2V papt table=%#llx n=%llu",
+				(unsigned long long)papt_table, (unsigned long long)papt_table_n);
+			if (papt_table_n > 16) papt_table_n = 16; // cap beacon spam
+			struct sptm_papt_entry {
+				uint64_t paddr_start;
+				uint64_t papt_start;
+				uint64_t num_mappings;
+			} sptm_papt_table[papt_table_n];
+			kreadbuf(papt_table, &sptm_papt_table[0], sizeof(sptm_papt_table));
+			for (uint64_t i = 0; i < papt_table_n; i++) {
+				tr_beacon("P2V papt[%llu] pa=%#llx va=%#llx nmap=%llu",
+					(unsigned long long)i,
+					(unsigned long long)sptm_papt_table[i].paddr_start,
+					(unsigned long long)sptm_papt_table[i].papt_start,
+					(unsigned long long)sptm_papt_table[i].num_mappings);
+			}
+		}
+	}
+}
+
+// v20: build known-good VA windows from the same sources phystokv uses
+static void tr_guard_init(void)
+{
+	if (tr_guard_inited) return;
+	tr_guard_inited = true;
+
+	int n = 0;
+
+	if (ksymbol(ptov_table)) {
+		struct ptov_table_entry {
+			uint64_t pa;
+			uint64_t va;
+			uint64_t len;
+		} ptov_table[PTOV_TABLE_SIZE_];
+		kreadbuf(ksymbol(ptov_table), &ptov_table[0], sizeof(ptov_table));
+		for (int i = 0; i < PTOV_TABLE_SIZE_ && n < (int)(sizeof(tr_guard_windows)/sizeof(tr_guard_windows[0])); i++) {
+			if (ptov_table[i].len != 0) {
+				tr_guard_windows[n].lo = ptov_table[i].va;
+				tr_guard_windows[n].hi = ptov_table[i].va + ptov_table[i].len;
+				n++;
+			}
+		}
+	}
+
+	if (ksymbol(libsptm_papt_ranges)) {
+		uint64_t papt_table = kread_ptr(ksymbol(libsptm_papt_ranges));
+		uint64_t papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+		if (papt_table_n > 8) papt_table_n = 8;
+		struct sptm_papt_entry {
+			uint64_t paddr_start;
+			uint64_t papt_start;
+			uint64_t num_mappings;
+		} sptm_papt_table[papt_table_n ? papt_table_n : 1];
+		if (papt_table_n) {
+			kreadbuf(papt_table, &sptm_papt_table[0], sizeof(sptm_papt_table));
+			for (uint64_t i = 0; i < papt_table_n && n < (int)(sizeof(tr_guard_windows)/sizeof(tr_guard_windows[0])); i++) {
+				tr_guard_windows[n].lo = sptm_papt_table[i].papt_start;
+				tr_guard_windows[n].hi = sptm_papt_table[i].papt_start +
+					(sptm_papt_table[i].num_mappings * vm_real_kernel_page_size);
+				n++;
+			}
+		}
+	}
+
+	// v20 STRICT GUARD: only fall back to the classic kernel window when we
+	// have NO real ptov/papt data. On A18/SPTM both tables exist, so any
+	// phystokv result outside them is suspect -- including the naive
+	// pa-physBase+virtBase arithmetic that produced the +0x6334 panics
+	// (far=0xfffffff04cd29ba8 lands inside virtBase+2GB, so a blanket
+	// window here would defeat the whole guard).
+	if (n == 0) {
+		uint64_t vb = kconstant(virtBase);
+		tr_guard_windows[n].lo = vb;
+		tr_guard_windows[n].hi = vb + 0x80000000ULL; // 2GB kernel span
+		n++;
+	}
+
+	tr_guard_window_count = n;
+}
+
+// v20: returns true if va falls inside a known-good kernel VA window
+bool tr_va_in_known_window(uint64_t va)
+{
+	tr_guard_init();
+	for (int i = 0; i < tr_guard_window_count; i++) {
+		if (va >= tr_guard_windows[i].lo && va < tr_guard_windows[i].hi) return true;
+	}
+	return false;
 }
 
 uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint64_t *leaf_tte_ttep)
@@ -69,6 +276,14 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 	uint64_t pa = 0;
 
 	bool physical = !(bool)(tte_ttep & 0xf000000000000000);
+
+	static bool telemetry_done = false;
+	if (!telemetry_done) {
+		telemetry_done = true;
+		tr_phystokv_telemetry_once();
+		tr_guard_init();
+		tr_beacon("GUARD armed windows=%d root=%llu", tr_guard_window_count, (unsigned long long)ROOT_LEVEL);
+	}
 
 	for (uint64_t curLevel = ROOT_LEVEL; curLevel <= LEAF_LEVEL; curLevel++) {
 		if (curLevel > PMAP_TT_L3_LEVEL) {
@@ -111,7 +326,24 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 			tte_ttep = tteEntry & ARM_TTE_TABLE_MASK;
 		}
 		else {
-			tte_ttep = phystokv(tteEntry & ARM_TTE_TABLE_MASK);
+			int mode = P2V_NONE;
+			uint64_t nextTtep = phystokv_ex(tteEntry & ARM_TTE_TABLE_MASK, &mode);
+
+			// v20 WANDER GUARD: refuse to kread an address phystokv cannot
+			// vouch for. The +0x6334 panics were kreads through exactly such
+			// addresses (far=0xfffffff04cd29ba8, kernel static region).
+			if (!nextTtep || !tr_va_in_known_window(nextTtep)) {
+				tr_beacon("EXPAND-WANDER va=%#llx lvl=%llu src_tte=%#llx tte_va=%#llx mode=%s cand=%#llx",
+					(unsigned long long)va, (unsigned long long)curLevel,
+					(unsigned long long)tteEntry,
+					(unsigned long long)(tte_ttep + (tteIndex * sizeof(uint64_t))),
+					tr_p2v_mode_name(mode),
+					(unsigned long long)nextTtep);
+				errno = 1045;
+				return 0;
+			}
+
+			tte_ttep = nextTtep;
 		}
 	}
 

@@ -532,7 +532,16 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 			do {
 				leafLevel = PMAP_TT_L3_LEVEL;
 				uint64_t pte = 0;
-				vtophys_lvl(ttep, va, &leafLevel, &pte);
+				uint64_t walkResult = vtophys_lvl(ttep, va, &leafLevel, &pte);
+				// v20: errno 1045 = EXPAND-WANDER guard trip in vtophys_lvl.
+				// phystokv produced an address outside every known-good
+				// kernel window; do NOT treat the aborted walk as a valid
+				// leaf. Bail out cleanly (-6) instead of writing through a
+				// garbage pte pointer (the old +0x6334 panic path).
+				if (errno == 1045 || (!walkResult && !pte)) {
+					lb_beacon("EXPAND WANDER-BAIL va=%#llx lvl=%d pte=%#llx", (unsigned long long)va, (int)leafLevel, (unsigned long long)pte);
+					return -6;
+				}
 				if (leafLevel != PMAP_TT_L3_LEVEL) {
 					uint64_t pt_va = 0;
 					switch (leafLevel) {
