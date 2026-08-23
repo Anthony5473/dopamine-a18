@@ -429,14 +429,50 @@ uint64_t pmap_alloc_page_table(uint64_t pmap, uint8_t level, uint64_t va_start)
 	return pt_pa;
 }
 
-// v19: forward decl (defined in ClearSword exploit, linked into same binary)
-extern void cs_beacon(const char *fmt, ...);
-extern unsigned long long v19_kread_count(void);
+// v19: self-contained beacon for libjailbreak (cs_beacon lives in the app
+// target, which is a separate binary from this dylib -- v19 build 32625275293
+// failed linking on that). Same shape as pt_beacon in physrw_pte.c.
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdarg.h>
+static void lb_beacon(const char *fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(8083);
+    if (inet_pton(AF_INET, "100.103.252.76", &sa.sin_addr) != 1) { close(fd); return; }
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+        char req[1280];
+        char enc[1024]; size_t ei = 0;
+        static const char hex[] = "0123456789ABCDEF";
+        for (const char *p = msg; *p && ei < sizeof(enc) - 4; p++) {
+            unsigned char c = (unsigned char)*p;
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) enc[ei++] = (char)c;
+            else { enc[ei++] = '%'; enc[ei++] = hex[c >> 4]; enc[ei++] = hex[c & 15]; }
+        }
+        enc[ei] = 0;
+        int n = snprintf(req, sizeof(req),
+            "GET /?msg=%s HTTP/1.1\r\nHost: 100.103.252.76\r\nConnection: close\r\n\r\n", enc);
+        if (n > 0) { size_t len = (size_t)n; ssize_t w = write(fd, req, len); (void)w; }
+    }
+    close(fd);
+}
 
 int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 {
 	uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
-	cs_beacon("EXPAND enter ttep=%#llx kcall=%d", (unsigned long long)ttep, (int)is_kcall_available());
+	lb_beacon("EXPAND enter ttep=%#llx kcall=%d", (unsigned long long)ttep, (int)is_kcall_available());
 
 	if (is_kcall_available()) {
 		uint64_t unmappedStart = 0, unmappedSize = 0;
@@ -447,12 +483,12 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 
 		for (uint64_t i = 0; i <= l2Count; i++) {
 			uint64_t curL2 = l2Start + (i * L2_BLOCK_SIZE);
-			cs_beacon("EXPAND kcall i=%llu/%llu curL2=%#llx KR=%llu", (unsigned long long)i, (unsigned long long)l2Count, (unsigned long long)curL2, v19_kread_count());
+			lb_beacon("EXPAND kcall i=%llu/%llu curL2=%#llx", (unsigned long long)i, (unsigned long long)l2Count, (unsigned long long)curL2);
 
 			uint64_t leafLevel = PMAP_TT_L3_LEVEL;
 			uint64_t pt3 = 0;
 			vtophys_lvl(ttep, curL2, &leafLevel, &pt3);
-			cs_beacon("EXPAND kcall i=%llu leaf=%d pt3=%#llx", (unsigned long long)i, (int)leafLevel, (unsigned long long)pt3);
+			lb_beacon("EXPAND kcall i=%llu leaf=%d pt3=%#llx", (unsigned long long)i, (int)leafLevel, (unsigned long long)pt3);
 			if (leafLevel == PMAP_TT_L3_LEVEL || i == l2Count) {
 				// i == l2Count: one extra cycle that this for loop takes
 				// We hit this block either if there was a mapping or at the end
@@ -491,7 +527,7 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 		uint64_t l2Start = (vaStart & ~L2_BLOCK_MASK);
 		uint64_t l2End   = (((vaStart + size) + (L2_BLOCK_SIZE-1)) & ~L2_BLOCK_MASK);
 		for (uint64_t va = l2Start; va < l2End; va += L2_BLOCK_SIZE) {
-			cs_beacon("EXPAND nokcall va=%#llx KR=%llu", (unsigned long long)va, v19_kread_count());
+			lb_beacon("EXPAND nokcall va=%#llx", (unsigned long long)va);
 			uint64_t leafLevel;
 			do {
 				leafLevel = PMAP_TT_L3_LEVEL;
@@ -511,6 +547,7 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 					}
 					leafLevel++;
 					uint64_t newTable = pmap_alloc_page_table(pmap, leafLevel, pt_va);
+					lb_beacon("EXPAND alloc lvl=%d pt=%#llx", (int)leafLevel, (unsigned long long)newTable);
 					if (newTable) {
 						uint64_t oldEntry = physread64(pte);
 						physwrite64(pte, newTable | ARM_TTE_VALID | ARM_TTE_TYPE_TABLE);
@@ -532,6 +569,7 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 						}
 					}
 					else {
+						lb_beacon("EXPAND FAIL alloc lvl=%d", (int)leafLevel);
 						return -2;
 					}
 				}
