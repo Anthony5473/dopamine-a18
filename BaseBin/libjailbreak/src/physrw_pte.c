@@ -200,15 +200,19 @@ int physrw_pte_handoff(pid_t pid, uint64_t *asidPtr)
 	int ret = 0;
 	do {
 		uint64_t task = proc_task(proc);
+		pt_beacon("chase task=%#llx", (unsigned long long)task);
 		if (!task) { ret = -3; break; };
 
 		uint64_t vmMap = kread_ptr(task + koffsetof(task, map));
+		pt_beacon("chase vmMap=%#llx", (unsigned long long)vmMap);
 		if (!vmMap) { ret = -4; break; };
 
 		uint64_t pmap = kread_ptr(vmMap + koffsetof(vm_map, pmap));
+		pt_beacon("chase pmap=%#llx", (unsigned long long)pmap);
 		if (!pmap) { ret = -5; break; };
 
 		uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
+		pt_beacon("chase ttep=%#llx", (unsigned long long)ttep);
 		pt_beacon("ttep=%#llx expanding", (unsigned long long)ttep);
 
 		// Allocate magic page table to our process at last possible location
