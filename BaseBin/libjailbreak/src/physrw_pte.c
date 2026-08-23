@@ -10,6 +10,48 @@
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 
+// ===== v17 physrw step telemetry =====
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <stdarg.h>
+static void pt_beacon(const char *fmt, ...)
+{
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return;
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(8083);
+    if (inet_pton(AF_INET, "100.103.252.76", &sa.sin_addr) != 1) { close(fd); return; }
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+        char req[1280];
+        int n;
+        // url-encode msg inline: non-alnum -> percent-encode
+        char enc[1024]; size_t ei = 0;
+        static const char hex[] = "0123456789ABCDEF";
+        for (const char *p = msg; *p && ei < sizeof(enc) - 4; p++) {
+            unsigned char c = (unsigned char)*p;
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) enc[ei++] = (char)c;
+            else { enc[ei++] = '%'; enc[ei++] = hex[c >> 4]; enc[ei++] = hex[c & 15]; }
+        }
+        enc[ei] = 0;
+        n = snprintf(req, sizeof(req),
+            "GET /?msg=%s HTTP/1.1\r\nHost: 100.103.252.76\r\nConnection: close\r\n\r\n", enc);
+        if (n > 0) { size_t len = (size_t)n; ssize_t w = write(fd, req, len); (void)w; }
+    }
+    close(fd);
+}
+// ===== end v17 telemetry =====
+
 void *gAsid = NULL;
 static pthread_mutex_t gLock;
 
@@ -152,6 +194,7 @@ int physrw_pte_handoff(pid_t pid, uint64_t *asidPtr)
 	if (!pid) return -1;
 
 	uint64_t proc = proc_find(pid);
+	pt_beacon("proc_find done proc=%#llx", (unsigned long long)proc);
 	if (!proc) return -2;
 
 	int ret = 0;
@@ -166,9 +209,11 @@ int physrw_pte_handoff(pid_t pid, uint64_t *asidPtr)
 		if (!pmap) { ret = -5; break; };
 
 		uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
+		pt_beacon("ttep=%#llx expanding", (unsigned long long)ttep);
 
 		// Allocate magic page table to our process at last possible location
 		int exp_r = pmap_expand_range(pmap, MAGIC_PT_ADDRESS, L2_BLOCK_SIZE);
+		pt_beacon("expand_range r=%d", exp_r);
 		if (exp_r != 0) { ret = -6; break; }
 
 		// Map in the magic page table at MAGIC_PT_ADDRESS
@@ -176,6 +221,7 @@ int physrw_pte_handoff(pid_t pid, uint64_t *asidPtr)
 		uint64_t magicPT = vtophys_lvl(ttep, MAGIC_PT_ADDRESS, &leafLevel, NULL);
 		if (!magicPT) { ret = -7; break; }
 		physwrite64(magicPT, magicPT | PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);
+		pt_beacon("pt1 written");
 
 		// Map in the pmap at MAGIC_PT_ADDRESS+vm_real_kernel_page_size
 		uint64_t asid = pmap + (koffsetof(pmap, sw_asid) ?: koffsetof(pmap, asid));
@@ -184,12 +230,14 @@ int physrw_pte_handoff(pid_t pid, uint64_t *asidPtr)
 		uint64_t asid_pageoff = asid & vm_real_kernel_page_mask;
 		*asidPtr = (uint64_t)(MAGIC_PT_ADDRESS + vm_real_kernel_page_size + asid_pageoff);
 		physwrite64(magicPT+8, asid_page_pa | PERM_TO_PTE(PERM_KRW_URW) | PTE_NON_GLOBAL | PTE_OUTER_SHAREABLE | PTE_LEVEL3_ENTRY);
+		pt_beacon("pt2 written");
 
 		if (getpid() == pid) {
 			flush_tlb();
 		}
 	} while (0);
 
+	pt_beacon("handoff done ret=%d", ret);
 	proc_rele(proc);
 	return ret;
 }
@@ -197,6 +245,7 @@ int physrw_pte_handoff(pid_t pid, uint64_t *asidPtr)
 int libjailbreak_physrw_pte_init(bool receivedHandoff, uint64_t asidPtr)
 {
 	if (pthread_mutex_init(&gLock, NULL) != 0) return -8;
+	pt_beacon("pte-init begin receivedHandoff=%d", (int)receivedHandoff);
 
 	if (!receivedHandoff) {
 		physrw_pte_handoff(getpid(), (uint64_t *)&gAsid);
