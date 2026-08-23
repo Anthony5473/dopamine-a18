@@ -429,9 +429,14 @@ uint64_t pmap_alloc_page_table(uint64_t pmap, uint8_t level, uint64_t va_start)
 	return pt_pa;
 }
 
+// v19: forward decl (defined in ClearSword exploit, linked into same binary)
+extern void cs_beacon(const char *fmt, ...);
+extern unsigned long long v19_kread_count(void);
+
 int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 {
 	uint64_t ttep = kread64(pmap + koffsetof(pmap, ttep));
+	cs_beacon("EXPAND enter ttep=%#llx kcall=%d", (unsigned long long)ttep, (int)is_kcall_available());
 
 	if (is_kcall_available()) {
 		uint64_t unmappedStart = 0, unmappedSize = 0;
@@ -442,10 +447,12 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 
 		for (uint64_t i = 0; i <= l2Count; i++) {
 			uint64_t curL2 = l2Start + (i * L2_BLOCK_SIZE);
+			cs_beacon("EXPAND kcall i=%llu/%llu curL2=%#llx KR=%llu", (unsigned long long)i, (unsigned long long)l2Count, (unsigned long long)curL2, v19_kread_count());
 
 			uint64_t leafLevel = PMAP_TT_L3_LEVEL;
 			uint64_t pt3 = 0;
 			vtophys_lvl(ttep, curL2, &leafLevel, &pt3);
+			cs_beacon("EXPAND kcall i=%llu leaf=%d pt3=%#llx", (unsigned long long)i, (int)leafLevel, (unsigned long long)pt3);
 			if (leafLevel == PMAP_TT_L3_LEVEL || i == l2Count) {
 				// i == l2Count: one extra cycle that this for loop takes
 				// We hit this block either if there was a mapping or at the end
@@ -484,6 +491,7 @@ int pmap_expand_range(uint64_t pmap, uint64_t vaStart, uint64_t size)
 		uint64_t l2Start = (vaStart & ~L2_BLOCK_MASK);
 		uint64_t l2End   = (((vaStart + size) + (L2_BLOCK_SIZE-1)) & ~L2_BLOCK_MASK);
 		for (uint64_t va = l2Start; va < l2End; va += L2_BLOCK_SIZE) {
+			cs_beacon("EXPAND nokcall va=%#llx KR=%llu", (unsigned long long)va, v19_kread_count());
 			uint64_t leafLevel;
 			do {
 				leafLevel = PMAP_TT_L3_LEVEL;
