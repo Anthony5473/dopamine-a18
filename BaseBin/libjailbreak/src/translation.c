@@ -120,6 +120,13 @@ uint64_t sptm_phystokv(uint64_t pa)
 
 		uint64_t len = curEntry->num_mappings * vm_real_kernel_page_size;
 		if ((pa >= curEntry->paddr_start) && (pa < (curEntry->paddr_start + len))) {
+			// v24: va==0 entries are PHYSICAL-ONLY (no linear alias exists).
+			// Aliasing through them yields a tiny garbage VA; storing through
+			// that killed every post-WIN run (the +0x6334 family). Bail clean.
+			if (curEntry->papt_start == 0) {
+				errno = 1047;
+				return 0;
+			}
 			return pa - curEntry->paddr_start + curEntry->papt_start;
 		}
 	}
@@ -171,6 +178,13 @@ int tr_write_guard(uint64_t pa)
 		uint64_t len = ents[i].num_mappings * vm_real_kernel_page_size;
 		if ((pa >= ents[i].paddr_start) && (pa < (ents[i].paddr_start + len))) {
 			uint64_t alias_va = pa - ents[i].paddr_start + ents[i].papt_start;
+			if (alias_va < 0xffffff8000000000ULL) {
+				tr_beacon("TEXTWRITE-ALIASBAD idx=%llu pa=%#llx va=%#llx",
+					(unsigned long long)i,
+					(unsigned long long)pa, (unsigned long long)alias_va);
+				errno = 1047;
+				return 1047;
+			}
 			if (alias_va >= wg_lo && alias_va < wg_hi) {
 				tr_beacon("TEXTWRITE-REFUSED idx=%llu pa=%#llx va=%#llx",
 					(unsigned long long)i,
