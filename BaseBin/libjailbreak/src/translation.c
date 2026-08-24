@@ -127,14 +127,32 @@ uint64_t sptm_phystokv(uint64_t pa)
 	return 0;
 }
 
-// v22: write-path tripwire. Refuse physical writes whose destination PA lands
-// inside the kernel-image PAPT spans (observed boots: papt[0]=static data,
-// papt[1]=kernelcache text/exec). Page tables never live in the kernel image,
-// so a write targeting these spans is by definition a mistranslation.
+// v23: write-path tripwire, re-keyed. v22's PA-span rule (idx<=1 refuse)
+// also blocked LEGITIMATE pmap metadata writes -- their aliases land in the
+// kernel data region just above kbase (observed kbase+0x5E0000..0x700000),
+// and v21 completed EXPAND with those writes flowing. The only target class
+// that is NEVER legitimately written is the execute-only __TEXT_EXEC region.
+// Cross-boot forensic anchor: execBase == kbase + 0x1058000 on every captured
+// panic (boots ...034555, ...143240, ...162252). We refuse aliases landing in
+// [kbase+0xF00000, kbase+0x2000000) -- covers exec text with margin on both
+// sides while leaving data/bss and all DRAM-linear aliases untouched.
 // Returns 0 to allow, 1046 + beacon on refusal.
 int tr_write_guard(uint64_t pa)
 {
-	static bool warned_unclassified = false;
+	static bool wg_inited = false;
+	static uint64_t wg_lo = 0, wg_hi = 0;
+	if (!wg_inited) {
+		wg_inited = true;
+		uint64_t kbase = kconstant(staticBase) + kconstant(slide);
+		if (kbase) {
+			wg_lo = kbase + 0xF00000ULL;
+			wg_hi = kbase + 0x2000000ULL;
+		}
+		tr_beacon("TEXTGUARD kbase=%#llx execwin=[%#llx,%#llx)",
+			(unsigned long long)kbase,
+			(unsigned long long)wg_lo, (unsigned long long)wg_hi);
+	}
+	if (!wg_lo) return 0;
 	if (!ksymbol(libsptm_papt_ranges)) return 0;
 
 	uint64_t papt_table = kread_ptr(ksymbol(libsptm_papt_ranges));
@@ -149,23 +167,19 @@ int tr_write_guard(uint64_t pa)
 	} ents[24];
 	kreadbuf(papt_table, &ents[0], papt_table_n * sizeof(ents[0]));
 
-	bool classified = false;
 	for (uint64_t i = 0; i < papt_table_n; i++) {
 		uint64_t len = ents[i].num_mappings * vm_real_kernel_page_size;
 		if ((pa >= ents[i].paddr_start) && (pa < (ents[i].paddr_start + len))) {
-			classified = true;
-			if (i <= 1) {
-				tr_beacon("TEXTWRITE-REFUSED idx=%llu pa=%#llx",
-					(unsigned long long)i, (unsigned long long)pa);
+			uint64_t alias_va = pa - ents[i].paddr_start + ents[i].papt_start;
+			if (alias_va >= wg_lo && alias_va < wg_hi) {
+				tr_beacon("TEXTWRITE-REFUSED idx=%llu pa=%#llx va=%#llx",
+					(unsigned long long)i,
+					(unsigned long long)pa, (unsigned long long)alias_va);
 				errno = 1046;
 				return 1046;
 			}
 			break;
 		}
-	}
-	if (!classified && !warned_unclassified) {
-		warned_unclassified = true;
-		tr_beacon("TEXTWRITE-UNCLASSIFIED pa=%#llx", (unsigned long long)pa);
 	}
 	return 0;
 }
