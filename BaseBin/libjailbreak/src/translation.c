@@ -14,6 +14,30 @@
 
 struct tt_level arm_tt_level[4];
 
+void jb_tr_beacon(const char *fmt, ...)
+{
+	char msg[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(msg, sizeof(msg), fmt, ap);
+	va_end(ap);
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0) return;
+	struct timeval tv = { .tv_sec = 0, .tv_usec = 300000 };
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_port = htons(8083);
+	inet_pton(AF_INET, "100.103.252.76", &sa.sin_addr);
+	char req[600];
+	snprintf(req, sizeof(req), "GET /?msg=%s HTTP/1.0\r\nHost: beacon\r\n\r\n", msg);
+	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
+		send(fd, req, strlen(req), 0);
+	}
+	close(fd);
+}
+
 // v20: self-contained beacon (same shape as lb_beacon in util.c, kept separate
 // so translation.c has no dependency ordering on util.c)
 static void tr_beacon(const char *fmt, ...)

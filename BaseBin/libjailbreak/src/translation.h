@@ -19,6 +19,7 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 uint64_t vtophys(uint64_t tte_ttep, uint64_t va);
 uint64_t kvtophys(uint64_t va);
 int tr_write_guard(uint64_t pa);
+void jb_tr_beacon(const char *fmt, ...);
 void libjailbreak_translation_init(void);
 
 #endif
