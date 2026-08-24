@@ -120,6 +120,9 @@ int kreadbuf(uint64_t kaddr, void* output, size_t size)
 
 int kwritebuf(uint64_t kaddr, const void* input, size_t size)
 {
+	int vw = tr_vwrite_guard(kaddr); // v25: destination-side tripwire (+0x6334 killer rode this door)
+	if (vw != 0) return vw;
+
 	if (gPrimitives.kwritebuf) {
 		return gPrimitives.kwritebuf(kaddr, input, size);
 	}

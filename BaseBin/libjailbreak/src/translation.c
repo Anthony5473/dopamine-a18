@@ -198,6 +198,58 @@ int tr_write_guard(uint64_t pa)
 	return 0;
 }
 
+// v25: DESTINATION-VA guard for kwritebuf(). The v24 panic (pc execBase+0x6334,
+// bcopy stp tail, far=kbase+0x5B9C478, x2=0x10, x3=0x1337) rode the kwritebuf
+// path with ZERO ALIAS-WRITE beacons -- physwritebuf tr_write_guard never saw
+// it. far decoded as: inside the overall kernel static VA span but NOT in any
+// PAPT alias window and NOT in the kernel image => a wild destination no legit
+// data write should produce. Refuse exactly that class: canonical static-span
+// VAs falling in the gaps between legit windows. 1048 + beacon on refusal.
+int tr_vwrite_guard(uint64_t va)
+{
+	static bool vg_inited = false;
+	static uint64_t vg_lo = 0, vg_hi = 0;
+	if (!vg_inited) {
+		vg_inited = true;
+		uint64_t kbase = kconstant(staticBase) + kconstant(slide);
+		if (kbase) {
+			vg_lo = kbase;
+			vg_hi = kbase + 0x2000000ULL;
+		}
+		tr_beacon("VWRITEGUARD armed span=[%#llx,%#llx)",
+			(unsigned long long)vg_lo, (unsigned long long)vg_hi);
+	}
+	if (!vg_lo) return 0;
+	if (va < vg_lo || va >= vg_hi) return 0;
+
+	if (!ksymbol(libsptm_papt_ranges)) {
+		tr_beacon("VWRITE-REFUSED nopapt va=%#llx", (unsigned long long)va);
+		errno = 1048;
+		return 1048;
+	}
+	uint64_t papt_table = kread_ptr(ksymbol(libsptm_papt_ranges));
+	uint64_t papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+	if (!papt_table || !papt_table_n) return 0;
+	if (papt_table_n > 24) papt_table_n = 24;
+
+	struct {
+		uint64_t paddr_start;
+		uint64_t papt_start;
+		uint64_t num_mappings;
+	} ents[24];
+	kreadbuf(papt_table, &ents[0], papt_table_n * sizeof(ents[0]));
+
+	for (uint64_t i = 0; i < papt_table_n; i++) {
+		uint64_t len = ents[i].num_mappings * vm_real_kernel_page_size;
+		uint64_t wlo = ents[i].papt_start;
+		uint64_t whi = ents[i].papt_start + len;
+		if (wlo && va >= wlo && va < whi) return 0;
+	}
+	tr_beacon("VWRITE-REFUSED hole va=%#llx", (unsigned long long)va);
+	errno = 1048;
+	return 1048;
+}
+
 // v22: last-ditch trap classifier -- a userspace SIGSEGV/SIGBUS here means
 // SPTM rejected a userland-mapped access. Beacon it and die loudly instead
 // of looking like another silent dud.
