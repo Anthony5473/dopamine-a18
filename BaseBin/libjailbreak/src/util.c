@@ -211,6 +211,12 @@ uint16_t pagetable_get_refcnt(uint64_t pt_pa)
 
 void pagetable_set_refcnt(uint64_t pt_pa, uint16_t refcnt)
 {
+	if (!gPrimitives.physwritebuf) {
+		// v26: no phys backend yet (pre-handoff). Alias writes are forbidden
+		// (SPTM faults them); skip instead of dying. Caller handles the retry.
+		jb_tr_beacon("SETREFCNT-SKIP nobackend pa=%#llx", (unsigned long long)pt_pa);
+		return;
+	}
 	if (ksymbol(libsptm_frame_table)) {
 		uint64_t sptmFrame = pa_to_sptm_frame(pt_pa);
 		uint64_t refcntOff = sptm_frame_get_refcnt_off(sptmFrame);

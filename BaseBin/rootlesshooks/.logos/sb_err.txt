@@ -1,0 +1,2 @@
+Argument "Logos::Generator::MobileSubstrate::Group" isn't numeric in postincrement (++) at /d/ios-buildenv/theos/logos/bin/lib/Locale/Maketext/Simple.pm line 15.
+Argument "Logos::Generator::MobileSubstrate::StaticClassGroup" isn't numeric in postincrement (++) at /d/ios-buildenv/theos/logos/bin/lib/Locale/Maketext/Simple.pm line 15.

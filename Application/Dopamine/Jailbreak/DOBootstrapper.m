@@ -22,12 +22,17 @@
 #define BASEBIN_LINK_BUNDLED_VERSION @"1.0.0"
 #define LAUNCHCTL_BUNDLED_VERSION @"1:1.2.0"
 
-static NSDictionary *gBundledPackages = @{
+static NSDictionary *gBundledPackages = nil;
+static NSDictionary *bundledPackages(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ gBundledPackages = @{
     @"libkrw0-dopamine" : LIBKRW_DOPAMINE_BUNDLED_VERSION,
     @"libroot-dopamine" : LIBROOT_DOPAMINE_BUNDLED_VERSION,
     @"dopamine-basebin-link" : BASEBIN_LINK_BUNDLED_VERSION,
     @"launchctl" : LAUNCHCTL_BUNDLED_VERSION,
-};
+}; });
+    return gBundledPackages;
+}
 
 struct hfs_mount_args {
     char    *fspec;
@@ -522,7 +527,7 @@ NSString *const bootstrapErrorDomain = @"BootstrapErrorDomain";
 
 - (BOOL)shouldInstallPackage:(NSString *)identifier
 {
-    NSString *bundledVersion = gBundledPackages[identifier];
+    NSString *bundledVersion = bundledPackages()[identifier];
     if (!bundledVersion) return NO;
     
     NSString *installedVersion = [self installedVersionForPackageWithIdentifier:identifier];

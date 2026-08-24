@@ -88,6 +88,14 @@ extern void jb_tr_beacon(const char *fmt, ...); // v22 fix: exported wrapper in 
 
 int _physwritebuf_virt(uint64_t physaddr, const void* input, size_t size)
 {
+	// v26: PROVEN UNSAFE. The 01:51 boot panicked (bcopy +0x6334) on a store
+	// through a VALID PAPT window (papt[0], fatal pa=0x1000bad7398). On SPTM
+	// devices alias READS work but alias WRITES always fault in the kernel
+	// static region. Refuse instead of storing.
+	jb_tr_beacon("ALIAS-WRITE-FORBIDDEN pa=%#llx", (unsigned long long)physaddr);
+	errno = 1049;
+	return 1049;
+#if 0 // v26: dead alias-write path kept for reference
 	__block int pr = 0;
 	enumerate_pages(physaddr, size, vm_real_kernel_page_size, ^bool(uint64_t curPhys, size_t curSize){
 		uint64_t curKaddr = phystokv(curPhys);
@@ -103,6 +111,7 @@ int _physwritebuf_virt(uint64_t physaddr, const void* input, size_t size)
 		return true;
 	});
 	return pr;
+#endif
 }
 
 // Wrappers to gPrimitives
@@ -151,9 +160,8 @@ int physwritebuf(uint64_t physaddr, const void* input, size_t size)
 	if (gPrimitives.physwritebuf) {
 		return gPrimitives.physwritebuf(physaddr, input, size);
 	}
-	else if (gPrimitives.kwritebuf && gPrimitives.phystokv) {
-		return _physwritebuf_virt(physaddr, input, size);
-	}
+	// v26: no alias-write fallback. Without a real phys backend a physical
+	// write is IMPOSSIBLE (SPTM faults every static-region store); fail clean.
 	return -1;
 }
 
