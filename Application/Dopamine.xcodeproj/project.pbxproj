@@ -64,6 +64,7 @@
 		3165CFEF3020A565002737DA /* ipc_port.c in Sources */ = {isa = PBXBuildFile; fileRef = 3165CFE83020A565002737DA /* ipc_port.c */; };
 		3165CFF03020A565002737DA /* IOGPUDevice.c in Sources */ = {isa = PBXBuildFile; fileRef = 3165CFE63020A565002737DA /* IOGPUDevice.c */; };
 		3165CFF13020A565002737DA /* gfx.m in Sources */ = {isa = PBXBuildFile; fileRef = 3165CFE03020A565002737DA /* gfx.m */; };
+		3165CFF1A18PR0BE00000002 /* a18_probe.c in Sources */ = {isa = PBXBuildFile; fileRef = 3165CFE1A18PR0BE00000001 /* a18_probe.c */; };
 		3165CFF23020A565002737DA /* gfx_patchfinder.c in Sources */ = {isa = PBXBuildFile; fileRef = 3165CFE23020A565002737DA /* gfx_patchfinder.c */; };
 		3165CFF33020A565002737DA /* info.c in Sources */ = {isa = PBXBuildFile; fileRef = 3165CFE43020A565002737DA /* info.c */; };
 		3165CFF43020A565002737DA /* titan.m in Sources */ = {isa = PBXBuildFile; fileRef = 3165CFEE3020A565002737DA /* titan.m */; };
@@ -499,6 +500,7 @@
 		3165CFDE3020A565002737DA /* arm64.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = arm64.h; sourceTree = "<group>"; };
 		3165CFDF3020A565002737DA /* gfx.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = gfx.h; sourceTree = "<group>"; };
 		3165CFE03020A565002737DA /* gfx.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = gfx.m; sourceTree = "<group>"; };
+		3165CFE1A18PR0BE00000001 /* a18_probe.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = a18_probe.c; sourceTree = "<group>"; };
 		3165CFE13020A565002737DA /* gfx_patchfinder.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = gfx_patchfinder.h; sourceTree = "<group>"; };
 		3165CFE23020A565002737DA /* gfx_patchfinder.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = gfx_patchfinder.c; sourceTree = "<group>"; };
 		3165CFE33020A565002737DA /* info.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = info.h; sourceTree = "<group>"; };
@@ -1054,6 +1056,7 @@
 				3165CFDE3020A565002737DA /* arm64.h */,
 				3165CFDF3020A565002737DA /* gfx.h */,
 				3165CFE03020A565002737DA /* gfx.m */,
+				3165CFE1A18PR0BE00000001 /* a18_probe.c */,
 				3165CFE13020A565002737DA /* gfx_patchfinder.h */,
 				3165CFE23020A565002737DA /* gfx_patchfinder.c */,
 				3165CFE33020A565002737DA /* info.h */,
@@ -2213,6 +2216,7 @@
 				3165CFF03020A565002737DA /* IOGPUDevice.c in Sources */,
 				3165D0033020A579002737DA /* Titan.m in Sources */,
 				3165CFF13020A565002737DA /* gfx.m in Sources */,
+				3165CFF1A18PR0BE00000002 /* a18_probe.c in Sources */,
 				3165CFF23020A565002737DA /* gfx_patchfinder.c in Sources */,
 				3165CFF33020A565002737DA /* info.c in Sources */,
 				3165CFF43020A565002737DA /* titan.m in Sources */,

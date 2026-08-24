@@ -767,14 +767,14 @@ extern char **environ;
 
 - (BOOL)isPPLBypassRequired
 {
-    // A18/A18 Pro (TUPAI/TAHITI): no PPL/SPTM bypass exists yet, but it is NOT on
-    // the critical path for the ClearSword jailbreak flow (physwritebuf falls back
-    // to kwritebuf+phystokv). See project notes/32 and notes/34.
+    // v27: A18/A18 Pro (TUPAI/TAHITI) now route through Titan (ported SPTM
+    // bypass). The old hardcoded NO left expand with no working phys write,
+    // which deadlocks physrw_pte handoff on SPTM hardware.
     char machine[256];
     size_t mlen = sizeof(machine);
     if (sysctlbyname("hw.machine", machine, &mlen, NULL, 0) == 0) {
         if (strstr(machine, "iPhone17,") != NULL || strstr(machine, "iPhone18,") != NULL) {
-            return NO;
+            return YES;
         }
     }
     return [self isArm64e];
