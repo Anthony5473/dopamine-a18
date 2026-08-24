@@ -84,6 +84,8 @@ int _physreadbuf_virt(uint64_t physaddr, void* output, size_t size)
 	return pr;
 }
 
+extern int lb_beacon(const char *fmt, ...);
+
 int _physwritebuf_virt(uint64_t physaddr, const void* input, size_t size)
 {
 	__block int pr = 0;
@@ -93,6 +95,7 @@ int _physwritebuf_virt(uint64_t physaddr, const void* input, size_t size)
 			pr = errno;
 			return false;
 		}
+		lb_beacon("ALIAS-WRITE pa=%#llx va=%#llx", (unsigned long long)curPhys, (unsigned long long)curKaddr); // v22
 		pr = kwritebuf(curKaddr, &input[curPhys - physaddr], curSize);
 		if (pr != 0) {
 			return false;
@@ -139,6 +142,9 @@ int physreadbuf(uint64_t physaddr, void* output, size_t size)
 
 int physwritebuf(uint64_t physaddr, const void* input, size_t size)
 {
+	int wr = tr_write_guard(physaddr); // v22
+	if (wr != 0) return wr;
+
 	if (gPrimitives.physwritebuf) {
 		return gPrimitives.physwritebuf(physaddr, input, size);
 	}

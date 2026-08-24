@@ -244,6 +244,7 @@ void pagetable_modify_refcount(uint64_t pt_pa, int32_t delta)
 		refcntPtr = kvtophys(pinfo + 0x0);
 	}
 
+	if (tr_write_guard(refcntPtr) != 0) return; // v22
 	if (gPrimitives.physaccess_mapped) {
 		physaccess_mapped(refcntPtr, sizeof(uint16_t), ^(void *ptr){
 			_Atomic(uint16_t) *uintPtr = ptr;

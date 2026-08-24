@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <string.h>
+#include <signal.h>
 
 struct tt_level arm_tt_level[4];
 
@@ -102,6 +103,68 @@ uint64_t sptm_phystokv(uint64_t pa)
 	return 0;
 }
 
+// v22: write-path tripwire. Refuse physical writes whose destination PA lands
+// inside the kernel-image PAPT spans (observed boots: papt[0]=static data,
+// papt[1]=kernelcache text/exec). Page tables never live in the kernel image,
+// so a write targeting these spans is by definition a mistranslation.
+// Returns 0 to allow, 1046 + beacon on refusal.
+int tr_write_guard(uint64_t pa)
+{
+	static bool warned_unclassified = false;
+	if (!ksymbol(libsptm_papt_ranges)) return 0;
+
+	uint64_t papt_table = kread_ptr(ksymbol(libsptm_papt_ranges));
+	uint64_t papt_table_n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+	if (!papt_table || !papt_table_n) return 0;
+	if (papt_table_n > 24) papt_table_n = 24;
+
+	struct {
+		uint64_t paddr_start;
+		uint64_t papt_start;
+		uint64_t num_mappings;
+	} ents[24];
+	kreadbuf(papt_table, &ents[0], papt_table_n * sizeof(ents[0]));
+
+	bool classified = false;
+	for (uint64_t i = 0; i < papt_table_n; i++) {
+		uint64_t len = ents[i].num_mappings * vm_real_kernel_page_size;
+		if ((pa >= ents[i].paddr_start) && (pa < (ents[i].paddr_start + len))) {
+			classified = true;
+			if (i <= 1) {
+				tr_beacon("TEXTWRITE-REFUSED idx=%llu pa=%#llx",
+					(unsigned long long)i, (unsigned long long)pa);
+				errno = 1046;
+				return 1046;
+			}
+			break;
+		}
+	}
+	if (!classified && !warned_unclassified) {
+		warned_unclassified = true;
+		tr_beacon("TEXTWRITE-UNCLASSIFIED pa=%#llx", (unsigned long long)pa);
+	}
+	return 0;
+}
+
+// v22: last-ditch trap classifier -- a userspace SIGSEGV/SIGBUS here means
+// SPTM rejected a userland-mapped access. Beacon it and die loudly instead
+// of looking like another silent dud.
+static void tr_trap_handler(int sig, siginfo_t *si, void *ctx)
+{
+	tr_beacon("WRITE-TRAP sig=%d far=%#llx", sig, (unsigned long long)(uintptr_t)si->si_addr);
+	signal(sig, SIG_DFL);
+	// returning re-executes the faulting instruction -> visible crash
+}
+
+static void tr_install_trap_handler(void)
+{
+	struct sigaction sa = {};
+	sa.sa_sigaction = tr_trap_handler;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &sa, NULL);
+	sigaction(SIGBUS, &sa, NULL);
+}
+
 // v20: out_mode classifies which path produced the answer (for beacons/guards)
 static uint64_t phystokv_ex(uint64_t pa, int *out_mode)
 {
@@ -160,6 +223,7 @@ static void tr_phystokv_telemetry_once(void)
 {
 	if (tr_telemetry_done) return;
 	tr_telemetry_done = true;
+	tr_install_trap_handler(); // v22
 	{
 		tr_beacon("P2V init ptov_sym=%#llx papt_sym=%#llx physBase=%#llx virtBase=%#llx",
 			(unsigned long long)ksymbol(ptov_table),
@@ -200,6 +264,21 @@ static void tr_phystokv_telemetry_once(void)
 					(unsigned long long)sptm_papt_table[i].paddr_start,
 					(unsigned long long)sptm_papt_table[i].papt_start,
 					(unsigned long long)sptm_papt_table[i].num_mappings);
+			}
+			// v22: raw hexdump to discover TRUE entry stride + perm/attribution fields
+			{
+				uint8_t raw[640];
+				static const char hx[] = "0123456789abcdef";
+				char hex[193];
+				kreadbuf(papt_table, raw, sizeof(raw));
+				for (uint64_t off = 0; off < sizeof(raw); off += 64) {
+					for (int b = 0; b < 64; b++) {
+						hex[b*2]   = hx[raw[off+b] >> 4];
+						hex[b*2+1] = hx[raw[off+b] & 0xf];
+					}
+					hex[192] = 0;
+					tr_beacon("P2VRAW o=%#llx %s", (unsigned long long)off, hex);
+				}
 			}
 		}
 	}
