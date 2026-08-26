@@ -7,6 +7,12 @@
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
 
+// v44: fw-scan instrumentation context. Lives in libjailbreak (linked by every
+// exploit framework) so Titan can arm it and ClearSword's krw.c can read it
+// without a cross-framework symbol dependency (v44 CI link failure lesson).
+int g_fwscan_active = 0;
+void cs_set_fwscan_active(int v) { g_fwscan_active = v; }
+
 uint64_t proc_find(pid_t pidToFind)
 {
 	__block uint64_t foundProc = 0;

@@ -18,6 +18,12 @@ typedef enum
 	KALLOC_OPTION_LOCAL, // Allocation attached to this process, freed on process exit
 } kalloc_options;
 
+// v44: fw-scan instrumentation context (defined in kernel.c). While nonzero,
+// ClearSword's KR beacons also fire at power-of-two read indices so a panic's
+// beacon tail names the exact killer read. Titan arms it around the fw-scan.
+extern int g_fwscan_active;
+void cs_set_fwscan_active(int v);
+
 void enumerate_pages(uint64_t start, size_t size, uint64_t pageSize, bool (^block)(uint64_t, size_t));
 
 int kreadbuf(uint64_t kaddr, void* output, size_t size);
