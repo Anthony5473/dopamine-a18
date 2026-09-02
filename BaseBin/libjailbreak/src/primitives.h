@@ -23,6 +23,10 @@ typedef enum
 // beacon tail names the exact killer read. Titan arms it around the fw-scan.
 extern int g_fwscan_active;
 void cs_set_fwscan_active(int v);
+// v52: write-path health gate — dispatcher lives here (kernel.c); ClearSword
+// registers the real implementation at corrupt-success. No-op elsewhere.
+void cs_v52_health_gate(void);
+void cs_v52_register_gate_hook(void (*hook)(void));
 
 void enumerate_pages(uint64_t start, size_t size, uint64_t pageSize, bool (^block)(uint64_t, size_t));
 

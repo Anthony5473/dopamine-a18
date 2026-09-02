@@ -13,6 +13,14 @@
 int g_fwscan_active = 0;
 void cs_set_fwscan_active(int v) { g_fwscan_active = v; }
 
+// v52: write-path health gate dispatcher (same cross-framework lesson as
+// above — CI run 33691600039 failed linking Titan against krw.c's symbol).
+// ClearSword registers its real implementation in cs_v52_arm_health(); other
+// exploit flavors leave the hook NULL so the gate is a cheap no-op.
+static void (*g_v52_gate_hook)(void) = NULL;
+void cs_v52_register_gate_hook(void (*hook)(void)) { g_v52_gate_hook = hook; }
+void cs_v52_health_gate(void) { if (g_v52_gate_hook) g_v52_gate_hook(); }
+
 uint64_t proc_find(pid_t pidToFind)
 {
 	__block uint64_t foundProc = 0;
