@@ -17,7 +17,8 @@ for f in \
   Application/Dopamine/Exploits/ClearSword/exploit/socket.c \
   Application/Dopamine/Exploits/ClearSword/exploit/poc.c \
   Application/Dopamine/Exploits/ClearSword/exploit/phys_oob.c \
-  Application/Dopamine/Exploits/ClearSword/exploit/a18beacon.c ; do
+  Application/Dopamine/Exploits/ClearSword/exploit/a18beacon.c \
+  Application/Dopamine/Exploits/ClearSword/exploit/surface.c ; do
   echo "=== $f ==="
   clang "${FLAGS[@]}" $INC "$f" 2>&1 | grep -vE 'warning:|^\s*~|^\s*\^' | head -15
   if ! clang "${FLAGS[@]}" $INC "$f" >/dev/null 2>&1; then rc=1; echo "SYNTAX FAIL"; else echo "syntax OK"; fi
