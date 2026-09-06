@@ -3,6 +3,7 @@
 #import "translation.h"
 #import "kernel.h"
 #import "util.h"
+#import <errno.h>
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -347,7 +348,30 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// panicked because the pool's L2 page was a hole on that boot (the RMW
 	// read of origL2e faulted kernel-side). Census runs are passed in from
 	// a18_probe (IOSurface_set_hole_map) after census-done.
-	uint64_t l2PA = kvtophys(l2);
+	// v90 alias gate (v89 panic 14:06:59, esr 9600004f on the L2-slot alias
+	// WRITE): the census-only hole gate MISSed this boot's carve-out —
+	// Titan's PAPT view is not the primitive's write route (4 runs fed, the
+	// fault PA 0x10087d24000 was in none of them). All checks below are
+	// PURE SOFTWARE: page-table reads through valid mappings only, no
+	// data-page MMU access, cannot fault.
+	// (1) True table PA from its own L1 entry — independent of alias
+	//     arithmetic (v89's kvtophys-derived l2PA silently passed every
+	//     range check as 0 when the walk itself failed on a holed page).
+	// (2) kvtophys(l2) must succeed AND reproduce that PA — it reads only
+	//     page-table memory and returns 0 (errno 1042) cleanly on an
+	//     invalid entry, i.e. "this physmap alias cannot exist".
+	// (3) Census hole membership (kept — cheap, orthogonal, catches the
+	//     v86 signature directly).
+	uint64_t l2PA = l1e & ARM_TTE_TABLE_MASK;
+	errno = 0;
+	uint64_t l2Walked = kvtophys(l2);
+	if (l2PA == 0 || l2Walked == 0 || errno == 1042 || l2Walked != l2PA) {
+		jb_tr_beacon("KMAP skip,l2alias,l1e=%llx,pa=%llx,walked=%llx,errno=%d",
+		             (unsigned long long)l1e, (unsigned long long)l2PA,
+		             (unsigned long long)l2Walked, errno);
+		*uaddr = NULL;
+		return -1;
+	}
 	if (pa_in_hole(l2PA)) {
 		jb_tr_beacon("KMAP skip,l2holed,pa=%llx", (unsigned long long)l2PA);
 		*uaddr = NULL;
