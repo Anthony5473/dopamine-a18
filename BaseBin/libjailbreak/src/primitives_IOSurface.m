@@ -221,10 +221,17 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	}
 
 	// Walk our own user page tables: 16KB granule, 4 levels.
-	// L3 idx = VA[24:14], L2 idx = VA[35:25], L1 idx = VA[46:36],
-	// L0 idx = VA[47], OA = PTE bits [47:14].
-	uint64_t va   = (uint64_t)base0;
-	uint64_t tt   = ttep_self();
+	// v82: ttep_self() returns the root TABLE PHYS (v81's invalid-kaddr
+	// 0x1012a98c000 = the root PA fed straight to kread64 → refused →
+	// l0e=0 → 0,0,0 cascade). Convert via phystokv (root PAs live in the
+	// papt-covered DRAM spans). Fallback keeps the raw value if conversion
+	// returns 0, and both are beaconed.
+	uint64_t va    = (uint64_t)base0;
+	uint64_t ttP   = ttep_self();
+	uint64_t tt    = phystokv(ttP & 0x0000FFFFFFFFC000ULL);
+	if (!tt) tt = ttP;
+	jb_tr_beacon("KMAP tt,phys=%llx,va=%llx", (unsigned long long)ttP,
+	             (unsigned long long)tt);
 	uint64_t l0e  = kread64(tt + 8 * ((va >> 47) & 0x1));
 	uint64_t l1   = phystokv(l0e & 0x0000FFFFFFFFC000ULL);
 	uint64_t l1e  = kread64(l1 + 8 * ((va >> 36) & 0x7FF));
