@@ -57,6 +57,13 @@
         return;
     }
 
+    // v73c: same scene-update watchdog guard as DODebugLogView (bug_type 309,
+    // 2026-09-05 19:22:08): skip display work while the app is backgrounded;
+    // DOUIManager.logRecord keeps the full history.
+    if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive) {
+        return;
+    }
+
     [self.stackView.arrangedSubviews makeObjectsPerformSelector:@selector(setCompleted)];
 
     DOLyricsLogItemView *itemView = [[DOLyricsLogItemView alloc] initWithString:log completedImage:_checkmarkImage failedImage:_exclamationMarkImage successImage:_unlockedImage];

@@ -37,12 +37,24 @@
     return self;
 }
 
--(void)showLog:(NSString *)log
+- (void)showLog:(NSString *)log
 {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self showLog:log];
         });
+        return;
+    }
+
+    // v73c: scene-update watchdog guard. The jailbreak run keeps logging via
+    // the stdout/stderr pipe bridge (DOUIManager observeFileDescriptor) after
+    // the app is backgrounded; the append + scrollRangeToVisible below is a
+    // full TextKit2 viewport layout, and FrontBoard killed the process for a
+    // 10s scene-update transgression mid-fwscan (bug_type 309 0x8BADF00D,
+    // 2026-09-05 19:22:08, WatchdogVisibility: Background). Full history is
+    // still kept in DOUIManager.logRecord; the view just skips display work
+    // while the app is not active.
+    if ([[UIApplication sharedApplication] applicationState] != UIApplicationStateActive) {
         return;
     }
 
