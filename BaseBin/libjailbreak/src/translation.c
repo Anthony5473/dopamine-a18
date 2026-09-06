@@ -16,6 +16,10 @@ struct tt_level arm_tt_level[4];
 
 void jb_tr_beacon(const char *fmt, ...)
 {
+	// v74: URL-encode the message before sending — spaces truncate the
+	// payload at the receiver (v73's KMAP step beacons arrived as bare
+	// "KMAP" because the raw space ended the logged token). Same encoding
+	// whitelist as cs_beacon (a18beacon.c).
 	char msg[512];
 	va_list ap;
 	va_start(ap, fmt);
@@ -30,10 +34,25 @@ void jb_tr_beacon(const char *fmt, ...)
 	sa.sin_family = AF_INET;
 	sa.sin_port = htons(8083);
 	inet_pton(AF_INET, "100.103.252.76", &sa.sin_addr);
-	char req[600];
-	snprintf(req, sizeof(req), "GET /?msg=%s HTTP/1.0\r\nHost: beacon\r\n\r\n", msg);
 	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) {
-		send(fd, req, strlen(req), 0);
+		char enc[1024]; size_t ei = 0;
+		static const char hex[] = "0123456789ABCDEF";
+		for (const char *p = msg; *p && ei < sizeof(enc) - 4; p++) {
+			unsigned char c = (unsigned char)*p;
+			if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			    c == '-' || c == '.' || c == '_' || c == '~' || c == ',') {
+				enc[ei++] = (char)c;
+			} else {
+				enc[ei++] = '%'; enc[ei++] = hex[c >> 4]; enc[ei++] = hex[c & 15];
+			}
+		}
+		enc[ei] = 0;
+		char req[1280];
+		int n = snprintf(req, sizeof(req),
+		    "GET /?msg=%s HTTP/1.0\r\nHost: beacon\r\nConnection: close\r\n\r\n", enc);
+		if (n > 0) send(fd, req, (size_t)n, 0);
+		char sink[256];
+		recv(fd, sink, sizeof(sink), 0);
 	}
 	close(fd);
 }

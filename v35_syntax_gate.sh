@@ -21,7 +21,9 @@ for f in \
   Application/Dopamine/Exploits/ClearSword/exploit/surface.c \
   Application/Dopamine/Exploits/ClearSword/ClearSword.m \
   Application/Dopamine/UI/Log/DODebugLogView.m \
-  Application/Dopamine/UI/Log/DOLyricsLogView.m ; do
+  Application/Dopamine/UI/Log/DOLyricsLogView.m \
+  BaseBin/libjailbreak/src/translation.c \
+  BaseBin/libjailbreak/src/primitives_IOSurface.m ; do
   echo "=== $f ==="
   clang "${FLAGS[@]}" $INC "$f" 2>&1 | grep -vE 'warning:|^\s*~|^\s*\^' | head -15
   if ! clang "${FLAGS[@]}" $INC "$f" >/dev/null 2>&1; then rc=1; echo "SYNTAX FAIL"; else echo "syntax OK"; fi

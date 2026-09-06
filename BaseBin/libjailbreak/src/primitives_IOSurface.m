@@ -172,6 +172,15 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)surface,
 	             (unsigned long long)desc, (unsigned long long)ranges);
 
+	// v74: record the ORIGINAL descriptor state before any rewrite — the
+	// step2-null-base verdict needs a pre-write baseline to interpret.
+	jb_tr_beacon("KMAP pre,r0=%llx,r1=%llx,d70=%llx,d18=%llx,d90=%llx",
+	             (unsigned long long)kread64(ranges),
+	             (unsigned long long)kread64(ranges + 8),
+	             (unsigned long long)kread64(desc + 0x70),
+	             (unsigned long long)kread64(desc + 0x18),
+	             (unsigned long long)kread64(desc + 0x90));
+
 	if (gPrimitives.krwMinSafeReadSize > 0x10) {
 		jb_tr_beacon("KMAP path,fakeranges,minsafe=%x", gPrimitives.krwMinSafeReadSize);
 		// If the primitive we have cannot read <=0x10 bytes at a time, we need to create our own struct
@@ -183,6 +192,12 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		uint64_t fakeRanges_kva = phystokv(vtophys(ttep_self(), (uint64_t)fakeRanges));
 		jb_tr_beacon("KMAP fakeranges,kva=%llx", (unsigned long long)fakeRanges_kva);
 		IOMemoryDescriptor_set_ranges(desc, fakeRanges_kva);
+		// v74: readback — did the ranges-field swap land, and does the
+		// kernel-side alias of our fake struct read back pa/size?
+		jb_tr_beacon("KMAP rb,ranges,now=%llx,via=%llx,%llx",
+		             (unsigned long long)IOMemoryDescriptor_get_ranges(desc),
+		             (unsigned long long)kread64(fakeRanges_kva),
+		             (unsigned long long)kread64(fakeRanges_kva + 8));
 		cleanups = realloc(cleanups, ++cleanupsCount * sizeof(struct IOSurface_toCleanup));
 		cleanups[cleanupsCount-1].descriptor = desc;
 		cleanups[cleanupsCount-1].origRanges = ranges;
@@ -191,6 +206,11 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	else {
 		kwrite64(ranges, pa);
 		kwrite64(ranges+8, size);
+		// v74: readback of the direct pokes (dead branch today — minsafe=0x20
+		// — but if it ever runs it must self-verify).
+		jb_tr_beacon("KMAP rb,direct,%llx,%llx",
+		             (unsigned long long)kread64(ranges),
+		             (unsigned long long)kread64(ranges + 8));
 	}
 
 	IOMemoryDescriptor_set_size(desc, size);
@@ -198,6 +218,13 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	kwrite64(desc + 0x70, 0);
 	kwrite64(desc + 0x18, 0);
 	kwrite64(desc + 0x90, 0);
+	// v74: readback of the Fugu15-era descriptor pokes — if these land and
+	// step2 still returns base=0, the offsets are right and the base path
+	// (IOSurfaceClient walk) is what's wrong for 18.2.
+	jb_tr_beacon("KMAP rb,pokes,%llx,%llx,%llx",
+	             (unsigned long long)kread64(desc + 0x70),
+	             (unsigned long long)kread64(desc + 0x18),
+	             (unsigned long long)kread64(desc + 0x90));
 
 	IOMemoryDescriptor_set_wired(desc, true);
 
