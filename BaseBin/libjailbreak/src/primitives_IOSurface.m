@@ -361,7 +361,12 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 			// probe's first read still discriminates: hole content vs 0,0.)
 			uint64_t snap[16];
 			int nEntries = 0, nRewritten = 0;
-			uint64_t pagenum = (pa & ~0x3FFFULL) >> 12;
+			// v102 FIX (v101 verdict): the table's pagenum unit is 0x4000 —
+			// PA = pagenum * 0x4000 (v100's own sample: 0x404075 →
+			// 0x10101d4000). v101 wrote pa>>12 = 4x the correct pagenum,
+			// aiming the backing at PA/4 (unmapped) → C,first=0,0 was the
+			// bug, not a rebuild fight. pagenum = pa >> 14.
+			uint64_t pagenum = (pa & ~0x3FFFULL) >> 14;
 			for (int qi = 6; qi < 16; qi++) {
 				snap[qi] = kread64(aq2 + 8 * qi);
 				if (seq == 0)
