@@ -13,6 +13,21 @@
 int g_fwscan_active = 0;
 void cs_set_fwscan_active(int v) { g_fwscan_active = v; }
 
+// v106: OOB-reader bridge (same cross-framework lesson). ClearSword registers
+// its physical_oob_read_mo entry point here at init; Titan's fwscan calls it
+// through the pointer to read candidate pages near its PurpleGfxMem mapping.
+// Registered as: int (*)(uint64_t seeking_offset, uint8_t *out_buf)
+//   returns 0 on success (oob bytes in out_buf), non-zero on race failure.
+// Also: the ClearSword dylib re-opens its fds / respawns its free_thread
+// before registering — registration IS the "primitive alive" signal.
+static int (*g_v106_oob_read)(uint64_t, uint8_t *) = 0;
+void v106_register_oob_read(int (*fn)(uint64_t, uint8_t *)) { g_v106_oob_read = fn; }
+int v106_oob_read(uint64_t seeking_offset, uint8_t *out_buf)
+{
+	if (!g_v106_oob_read) return -1;
+	return g_v106_oob_read(seeking_offset, out_buf);
+}
+
 uint64_t proc_find(pid_t pidToFind)
 {
 	__block uint64_t foundProc = 0;
