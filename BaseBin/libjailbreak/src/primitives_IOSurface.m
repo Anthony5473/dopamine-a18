@@ -176,6 +176,7 @@ static int pa_in_hole(uint64_t pa)
 }
 
 uint64_t IOSurface_kalloc_16up(uint64_t size, bool leak); // fwd: defined below
+static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size); // v94 fwd: defined below
 
 struct IOSurface_toCleanup *cleanups = NULL;
 unsigned cleanupsCount = 0;
