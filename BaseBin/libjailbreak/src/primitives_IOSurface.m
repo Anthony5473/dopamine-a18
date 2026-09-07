@@ -394,17 +394,23 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 			// kbase is beaconed by ClearSword before Titan runs; stash it
 			// from the krw layer.
 			uint64_t pagenum;
-			// kbase: available in-process as kconstant(base) (info.c:654 —
-			// ClearSword sets kernelConstant.slide at WIN, libjailbreak
-			// derives base). seq%3 ladder:
-			//   0: carve-out PA (the hunt)
-			//   1: kernel text page — C,first must show Mach-O magic
-			//      0xfeedfacf if the rewrite path works end-to-end
-			//   2: carve-out PA (the hunt)
+			// v104 CONTROL FIX (v103 verdict: the control used kbase's
+			// VIRTUAL pagenum — kconstant(base) is the virtual kernel base;
+			// the wire maps PHYSICAL pages, so the control pointed at an
+			// invalid PA and 0,0 was EXPECTED on controls too — the rewrite
+			// path is NOT disproven). Correct control pagenum =
+			// physmap alias of the text page:
+			//   PA_text = kbase - virtBase + physBase
+			//   pagenum = PA_text >> 14
+			// (same translation the probe itself uses for its windows.)
 			{
-				uint64_t kbase = kconstant(base);
-				if ((seq % 3) == 1 && kbase && kbase != kconstant(staticBase))
-					pagenum = (kbase & ~0x3FFFULL) >> 14;
+				uint64_t pagenumCtl;
+				uint64_t paText = kconstant(base) - kconstant(virtBase)
+				                + kconstant(physBase);
+				pagenumCtl = paText >> 14;
+				if ((seq % 3) == 1 && kconstant(base)
+				                 && kconstant(base) != kconstant(staticBase))
+					pagenum = pagenumCtl;
 				else
 					pagenum = (pa & ~0x3FFFULL) >> 14;
 			}
