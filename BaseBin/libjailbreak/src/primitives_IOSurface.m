@@ -272,7 +272,7 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 			*uaddr = NULL;
 			return -1;
 		}
-		uint64_t backingPA = vtophys((uint64_t)base0v);
+		uint64_t backingPA = kvtophys((uint64_t)base0v);
 		jb_tr_beacon("KMAP wire1,base=%llx,pa=%llx",
 		             (unsigned long long)(uintptr_t)base0v,
 		             (unsigned long long)backingPA);
