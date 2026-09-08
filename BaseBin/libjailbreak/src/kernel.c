@@ -28,6 +28,17 @@ int v106_oob_read(uint64_t seeking_offset, uint8_t *out_buf)
 	return g_v106_oob_read(seeking_offset, out_buf);
 }
 
+// v107f: bounded OOB read — same bridge but the implementation is allowed to
+// FAIL (non-zero) instead of retrying forever. Titan's TS18E verifier uses
+// this so a degraded race thread beacons a clean verdict instead of hanging.
+static int (*g_v106_oob_read_bounded)(uint64_t, uint8_t *) = 0;
+void v106_register_oob_read_bounded(int (*fn)(uint64_t, uint8_t *)) { g_v106_oob_read_bounded = fn; }
+int v106_oob_read_bounded(uint64_t seeking_offset, uint8_t *out_buf)
+{
+	if (!g_v106_oob_read_bounded) return -1;   // unregistered => treat as dead
+	return g_v106_oob_read_bounded(seeking_offset, out_buf);
+}
+
 uint64_t proc_find(pid_t pidToFind)
 {
 	__block uint64_t foundProc = 0;
