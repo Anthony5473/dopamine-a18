@@ -724,6 +724,8 @@
 				exploit/socket.h,
 				exploit/surface.c,
 				exploit/surface.h,
+				exploit/ts18_tc.c,
+				exploit/ts18_tc.h,
 				exploit/utils.c,
 				exploit/utils.h,
 				Info.plist,

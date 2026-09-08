@@ -1,7 +1,7 @@
 #!/bin/bash
 # v35 syntax gate for the beacon instrumentation
 set -u
-cd /mnt/d/ios-buildenv/src/dopamine-a18 || exit 9
+cd /mnt/d/ios-buildenv/research/trollstore-18.2/dopamine-a18-ci || exit 9
 BB=BaseBin
 INC="-I$BB/.include -IDopamine -I$BB/ChOma/include -IApplication/Dopamine/Exploits/Titan/exploit -IApplication/Dopamine/Exploits/ClearSword/exploit -IApplication/Dopamine/UI -IApplication/Dopamine/UI/Log -IApplication/Dopamine/UI/Log/Indicator -I/mnt/d/ios-buildenv/_gateshims"
 FLAGS=(-fsyntax-only -ObjC -DCPUFAMILY_ARM_COLL=0x0f0f0f0f -DCPUFAMILY_ARM_TAHITI=0x1a1a1a1a
@@ -19,6 +19,7 @@ for f in \
   Application/Dopamine/Exploits/ClearSword/exploit/phys_oob.c \
   Application/Dopamine/Exploits/ClearSword/exploit/a18beacon.c \
   Application/Dopamine/Exploits/ClearSword/exploit/surface.c \
+  Application/Dopamine/Exploits/ClearSword/exploit/ts18_tc.c \
   Application/Dopamine/Exploits/ClearSword/ClearSword.m \
   Application/Dopamine/UI/Log/DODebugLogView.m \
   Application/Dopamine/UI/Log/DOLyricsLogView.m \
